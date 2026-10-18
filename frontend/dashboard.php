@@ -8,7 +8,7 @@ $role = $user['role'];
 $farmers = [];
 if ($role !== 'farmer') {
     $farmers_resp = api_request('GET', '/api/users/farmers');
-    $farmers = is_array($farmers_resp['data']) ? $farmers_resp['data'] : [];
+    $farmers = api_response_list($farmers_resp);
 }
 ?>
 <!DOCTYPE html>
@@ -129,7 +129,7 @@ if ($role !== 'farmer') {
 <!-- ═══════════════════════════════════════════════════════════════════════ -->
 <?php
     $insp_resp = api_request('GET', '/api/inspection?limit=20');
-    $farmer_inspections = is_array($insp_resp['data']) ? $insp_resp['data'] : [];
+    $farmer_inspections = api_response_list($insp_resp);
 ?>
 <h2 class="fw-bold mb-3">My Inspections</h2>
 <div class="card border-0 shadow-sm">
@@ -593,6 +593,6 @@ if ($role !== 'farmer') {
 <script src="<?= APP_BASE ?>/assets/js/dashboard.js?v=1"
         data-app-base="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>"
         data-api-base="<?= htmlspecialchars(API_BASE, ENT_QUOTES, 'UTF-8') ?>"></script>
-<script src="assets/js/api.js"></script>
+<script src="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>/assets/js/api.js"></script>
 </body>
 </html>

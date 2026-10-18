@@ -29,7 +29,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'email'    => $email,
             'password' => $password,
         ]);
-        if ($resp['status'] === 200 && isset($resp['data']['access_token'])) {
+        if ($resp['status'] === 200
+            && is_array($resp['data'])
+            && isset($resp['data']['access_token'])
+            && is_array($resp['data']['user'] ?? null)) {
             api_set_token($resp['data']['access_token'], $resp['data']['user']);
             header('Location: ' . APP_BASE . '/dashboard.php');
             exit;

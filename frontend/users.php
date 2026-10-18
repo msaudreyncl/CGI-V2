@@ -46,10 +46,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
 }
 
 $users_resp = api_request('GET', '/api/users');
-$all_users = $users_resp['data'] ?? [];
+$all_users = api_response_list($users_resp);
 
 $stats_resp = api_request('GET', '/api/users/stats');
-$user_stats = $stats_resp['data'] ?? [];
+$user_stats = $stats_resp['status'] === 200 && is_array($stats_resp['data'])
+    ? $stats_resp['data']
+    : [];
 
 function users_escape($value): string {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');

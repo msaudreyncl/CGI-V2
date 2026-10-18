@@ -3,7 +3,7 @@ require_once __DIR__ . '/api.php';
 api_require_auth(['admin', 'officer']);
 $user = api_current_user();
 $config_resp = api_request('GET', '/api/pricing/config');
-$configs     = $config_resp['data'] ?? [];
+$configs = api_response_list($config_resp);
 $msg = '';
 $msg_type = 'success';
 
@@ -19,11 +19,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $msg = $r['status'] === 200 ? 'Pricing config updated.' : ($r['data']['detail'] ?? 'Error saving.');
         $msg_type = $r['status'] === 200 ? 'success' : 'danger';
         $config_resp = api_request('GET', '/api/pricing/config');
-        $configs     = $config_resp['data'] ?? [];
+        $configs = api_response_list($config_resp);
     }
 }
 $cfg_map = [];
-foreach ($configs as $c) $cfg_map[$c['grade']] = $c;
+foreach ($configs as $c) {
+    if (isset($c['grade'])) $cfg_map[$c['grade']] = $c;
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">

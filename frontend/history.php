@@ -7,10 +7,7 @@ $page = max(1, (int)($_GET['page'] ?? 1));
 $limit = 20;
 $skip = ($page - 1) * $limit;
 $resp = api_request('GET', "/api/transactions?skip={$skip}&limit={$limit}");
-$transaction_data = $resp['data'] ?? null;
-$transactions = is_array($transaction_data) && array_is_list($transaction_data)
-    ? array_values(array_filter($transaction_data, 'is_array'))
-    : [];
+$transactions = api_response_list($resp);
 
 function history_escape($value): string {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');

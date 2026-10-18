@@ -4,6 +4,7 @@ main.py — FastAPI application entry point for the CGI backend.
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,7 @@ from routers.hardware             import router as hardware_router
 from routers.transaction_workflow import router as transaction_workflow_router
 
 settings = get_settings()
+BACKEND_DIR = Path(__file__).resolve().parent
 
 
 @asynccontextmanager
@@ -56,7 +58,7 @@ app.add_middleware(
 )
 
 # ── Static files (uploaded images) ───────────────────────────────────────────
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=BACKEND_DIR / "static"), name="static")
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth_router)

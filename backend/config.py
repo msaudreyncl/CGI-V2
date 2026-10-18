@@ -4,9 +4,12 @@ config.py — Application settings loaded from .env
 
 import os
 from functools import lru_cache
+from pathlib import Path
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class Settings:
@@ -26,10 +29,15 @@ class Settings:
     @property
     def DATABASE_URL(self) -> str:
         return (
-            f"mysql+pymysql://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"mysql+pymysql://{quote_plus(self.DB_USER)}:{quote_plus(self.DB_PASSWORD)}"
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
             f"?charset=utf8mb4"
         )
+
+    @staticmethod
+    def _project_path(value: str) -> str:
+        path = Path(value)
+        return str(path if path.is_absolute() else PROJECT_ROOT / path)
 
     # JWT
     JWT_SECRET:         str = os.getenv("JWT_SECRET", "CHANGE_ME")
@@ -37,11 +45,11 @@ class Settings:
     JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 
     # YOLOv8
-    YOLO_MODEL_PATH:  str   = os.getenv("YOLO_MODEL_PATH", "models/cgi_yolov8.pt")
+    YOLO_MODEL_PATH:  str   = _project_path(os.getenv("YOLO_MODEL_PATH", "models/cgi_yolov8.pt"))
     YOLO_CONFIDENCE:  float = float(os.getenv("YOLO_CONFIDENCE", "0.50"))
 
     # File storage
-    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "backend/static/uploads")
+    UPLOAD_DIR: str = _project_path(os.getenv("UPLOAD_DIR", "backend/static/uploads"))
 
     # Pricing API
     PRICE_API_URL:            str   = os.getenv("PRICE_API_URL", "")
