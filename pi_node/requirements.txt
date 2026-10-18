@@ -1,0 +1,12 @@
+# Raspberry Pi sensor node dependencies
+# Install on the Pi with: pip install -r requirements.txt
+
+# GPIO + HX711
+RPi.GPIO==0.7.1
+hx711==1.1.2.3
+
+# Pi Camera Module 3 (libcamera-based)
+picamera2==0.3.19
+
+# HTTP client to POST data to backend
+requests==2.31.0

@@ -1,0 +1,14 @@
+[Unit]
+Description=CGI Pi Sensor Node
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/CGI/pi_node
+ExecStart=/usr/bin/python3 /home/pi/CGI/pi_node/sensor_node.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

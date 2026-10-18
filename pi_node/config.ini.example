@@ -1,0 +1,39 @@
+[server]
+# IP address and port of the CGI backend server on the LAN
+SERVER_URL = http://192.168.1.10:8000
+
+# API token for the Pi node (set in backend .env as PI_NODE_TOKEN)
+PI_NODE_TOKEN = CHANGE_ME
+
+# Pi HTTP server settings (pi_server.py)
+# The backend will call this server to poll weight and trigger captures.
+PI_SERVER_HOST = 0.0.0.0
+PI_SERVER_PORT = 5000
+
+[camera]
+# Resolution for captured images (width x height)
+RESOLUTION_WIDTH  = 1920
+RESOLUTION_HEIGHT = 1080
+# Still image format
+IMAGE_FORMAT = jpeg
+# Autofocus wait time in seconds
+AUTOFOCUS_WAIT = 1.5
+
+[load_cell]
+# GPIO data pin connected to HX711 DT
+HX711_DT_PIN  = 5
+# GPIO clock pin connected to HX711 SCK
+HX711_SCK_PIN = 6
+# Calibration factor (run hx711_reader.py --calibrate to find this value)
+CALIBRATION_FACTOR = 1.0
+# Number of readings to average for a stable weight
+READINGS_TO_AVERAGE = 10
+# Acceptable weight range for 350 g sample (grams)
+WEIGHT_MIN_G = 340
+WEIGHT_MAX_G = 360
+
+[gpio]
+# GPIO pin for physical trigger button (BCM numbering)
+TRIGGER_BUTTON_PIN = 17
+# GPIO pin for status LED (optional)
+STATUS_LED_PIN = 27

@@ -1,0 +1,15 @@
+[Unit]
+Description=CGI FastAPI Backend (Uvicorn)
+After=network.target mysql.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/html/CGI/backend
+ExecStart=/var/www/html/CGI/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/var/www/html/CGI/.env
+
+[Install]
+WantedBy=multi-user.target
