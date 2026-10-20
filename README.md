@@ -20,7 +20,7 @@ computer vision (YOLOv8), load-sensing hardware, and a web application.
 ## Prerequisites
 
 ### Server Machine
-- Python 3.11+
+- Python 3.11 (recommended and supported for the Raspberry Pi backend dependency set)
 - MySQL 8.0+ (or XAMPP with MySQL)
 - Apache 2.4+ (for PHP frontend)
 - PHP 8.1+
@@ -40,14 +40,14 @@ computer vision (YOLOv8), load-sensing hardware, and a web application.
 ```bash
 # Example: place in XAMPP htdocs
 # C:\xampp\htdocs\CGI\   (Windows)
-# /var/www/html/CGI/     (Linux)
+# /var/www/html/CGI-V2/  (Linux)
 ```
 
 ### 2. Create and activate a Python virtual environment
 
 ```bash
-cd CGI/backend
-python -m venv venv
+cd CGI-V2
+python3.11 -m venv venv
 
 # Windows
 venv\Scripts\activate
@@ -59,7 +59,8 @@ source venv/bin/activate
 ### 3. Install Python dependencies
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --only-binary=:all: -r backend/requirements.txt
 ```
 
 ### 4. Configure environment variables
@@ -92,7 +93,8 @@ Update `YOLO_MODEL_PATH` in `.env` if the filename differs.
 ### 7. Start the FastAPI backend
 
 ```bash
-cd CGI/backend
+cd CGI-V2/backend
+source ../venv/bin/activate
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -116,6 +118,10 @@ sudo systemctl reload apache2
 
 ## Raspberry Pi Node Setup
 
+See `pi_node/INSTALL.md` for the required apt packages and the
+`--system-site-packages` virtual environment. Picamera2, libcamera, and GPIO
+bindings must come from Raspberry Pi OS, not PyPI.
+
 ### 1. Enable Camera and I2C/SPI
 
 ```bash
@@ -127,8 +133,12 @@ sudo raspi-config
 ### 2. Install Pi node dependencies
 
 ```bash
-cd CGI/pi_node
-pip install -r requirements.txt
+cd CGI-V2/pi_node
+sudo apt update
+sudo apt install -y python3-picamera2 python3-libcamera python3-rpi.gpio
+python3 -m venv --system-site-packages venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
 ### 3. Configure the node

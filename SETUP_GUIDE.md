@@ -273,8 +273,37 @@ With `(venv)` active:
 pip install -r backend\requirements.txt
 ```
 
-This installs: FastAPI, Uvicorn, SQLAlchemy, PyMySQL, bcrypt, python-jose, ReportLab,
-Ultralytics YOLOv8, OpenCV, Pillow, httpx, python-escpos, and more.
+The backend uses the following pinned direct dependencies on Windows and Linux:
+
+| Component | Package version |
+|---|---:|
+| FastAPI | `fastapi==0.111.0` |
+| Pydantic | `pydantic==2.7.1` |
+| Starlette | `starlette==0.37.2` |
+| Uvicorn | `uvicorn[standard]==0.29.0` |
+| SQLAlchemy | `sqlalchemy==2.0.30` |
+| PyMySQL | `pymysql==1.1.1` |
+| Cryptography | `cryptography==42.0.7` |
+| Python JOSE | `python-jose[cryptography]==3.3.0` |
+| bcrypt | `bcrypt==4.2.1` |
+| Python Multipart | `python-multipart==0.0.9` |
+| Python Dotenv | `python-dotenv==1.0.1` |
+| HTTPX | `httpx==0.27.0` |
+| Ultralytics | `ultralytics==8.2.18` |
+| PyTorch | `torch==2.2.2` |
+| TorchVision | `torchvision==0.17.2` |
+| NumPy | `numpy==1.26.4` |
+| OpenCV | `opencv-python==4.9.0.80` |
+| Pillow | `Pillow==10.3.0` |
+| ReportLab | `reportlab==4.1.0` |
+| Python ESC/POS | `python-escpos==3.1` |
+| aiofiles | `aiofiles==23.2.1` |
+| Email Validator | `email-validator==2.2.0` |
+
+`httpx2` and `opencv-python-headless` are intentionally not installed. The code
+imports `httpx`, and Ultralytics declares the full `opencv-python` distribution.
+Installing both OpenCV distributions can cause them to overwrite the same `cv2`
+package.
 
 > This may take 5–15 minutes on first install — YOLOv8 and OpenCV are large packages.
 
@@ -339,7 +368,9 @@ INFO:     Application startup complete.
 # Part B — Linux Server (Raspberry Pi OS / Debian / Ubuntu)
 
 > These steps apply to any Debian-based Linux. Commands are tested on
-> **Raspberry Pi OS Bookworm 64-bit** (Debian 12) and **Ubuntu 22.04 LTS**.
+> **Raspberry Pi OS Bookworm 64-bit** (Debian 12, system Python 3.11) and
+> **Ubuntu 22.04 LTS**. Python 3.13 is not supported by this pinned Raspberry Pi
+> ML stack; using Bookworm's Python 3.11 avoids source builds on ARM64.
 
 ## B1. System Requirements (Linux)
 
@@ -348,7 +379,7 @@ INFO:     Application startup complete.
 | Apache2 | 2.4+ | `apt` |
 | MySQL / MariaDB | 8.0+ / 10.6+ | `apt` |
 | PHP | 8.1+ | `apt` |
-| Python | 3.11 or 3.12 | `apt` |
+| Python | 3.11 (Raspberry Pi recommended) | `apt` |
 | Git | any | `apt` |
 
 ---
@@ -359,14 +390,14 @@ The CGI project must live inside Apache's web root so it can serve the PHP files
 
 **Default Apache web root:** `/var/www/html/`
 
-**Place the project at:** `/var/www/html/CGI/`
+**Place the project at:** `/var/www/html/CGI-V2/`
 
 **Clone from GitHub:**
 ```bash
 cd /var/www/html
-sudo git clone https://github.com/YOUR_ORG/CGI.git CGI
-sudo chown -R $USER:www-data CGI
-sudo chmod -R 755 CGI
+sudo git clone https://github.com/YOUR_ORG/CGI.git CGI-V2
+sudo chown -R $USER:www-data CGI-V2
+sudo chmod -R 755 CGI-V2
 ```
 
 Or copy files manually via SCP/SFTP.
@@ -403,7 +434,7 @@ sudo apt install -y mysql-server
 sudo apt install -y php php-mysql php-curl php-json php-mbstring libapache2-mod-php
 
 # Python and pip
-sudo apt install -y python3 python3-pip python3-venv python3-dev
+sudo apt install -y python3 python3-pip python3-venv python3-dev libgl1 libglib2.0-0
 
 # Git (if not already installed)
 sudo apt install -y git
@@ -441,7 +472,7 @@ sudo a2enmod rewrite
 sudo systemctl restart apache2
 ```
 
-### Allow Apache to serve from `/var/www/html/CGI/`
+### Allow Apache to serve from `/var/www/html/CGI-V2/`
 
 Edit the default site config to allow `.htaccess` overrides:
 
@@ -498,7 +529,7 @@ EXIT;
 ### Step B4c — Run schema.sql
 
 ```bash
-mysql -u cgiuser -p cgi_db < /var/www/html/CGI/database/schema.sql
+mysql -u cgiuser -p cgi_db < /var/www/html/CGI-V2/database/schema.sql
 ```
 
 Enter the password when prompted. A success exit (no error output) means it worked.
@@ -522,7 +553,7 @@ users
 ### Step B4d — Run seed.sql
 
 ```bash
-mysql -u cgiuser -p cgi_db < /var/www/html/CGI/database/seed.sql
+mysql -u cgiuser -p cgi_db < /var/www/html/CGI-V2/database/seed.sql
 ```
 
 Verify:
@@ -544,7 +575,7 @@ Expected:
 ## B5. Environment Configuration (Linux)
 
 ```bash
-cd /var/www/html/CGI
+cd /var/www/html/CGI-V2
 cp .env.example .env
 nano .env
 ```
@@ -603,7 +634,7 @@ Save with Ctrl+X → Y → Enter.
 ## B6. Python Virtual Environment (Linux)
 
 ```bash
-cd /var/www/html/CGI
+cd /var/www/html/CGI-V2
 
 # Create the virtual environment (only once)
 python3 -m venv venv
@@ -614,7 +645,7 @@ source venv/bin/activate
 
 Your prompt should now start with `(venv)`:
 ```
-(venv) user@hostname:/var/www/html/CGI$
+(venv) user@hostname:/var/www/html/CGI-V2$
 ```
 
 > Run `source venv/bin/activate` every time you open a new terminal
@@ -627,27 +658,36 @@ Your prompt should now start with `(venv)`:
 With `(venv)` active:
 
 ```bash
-pip install -r backend/requirements.txt
+python --version
+# Expected on Raspberry Pi OS Bookworm: Python 3.11.x
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --only-binary=:all: -r backend/requirements.txt
+python -m pip check
 ```
 
-This installs: FastAPI, Uvicorn, SQLAlchemy, PyMySQL, bcrypt, python-jose, ReportLab,
-Ultralytics YOLOv8, OpenCV, Pillow, httpx, python-escpos, and more.
+This installs the exact versions listed in **A7. Install Python Dependencies
+(Windows)**, including matching CPU PyTorch/TorchVision ARM64 wheels.
+`--only-binary=:all:` is intentional: it fails early instead of attempting long,
+fragile native builds.
 
 > This may take 5–15 minutes — YOLOv8 and OpenCV are large packages.
 > On a Raspberry Pi 4/5 running the server role it may take up to 30 minutes.
 
 Confirm the install succeeded:
 ```bash
-pip show fastapi
+python -c "import fastapi, uvicorn, sqlalchemy, httpx, numpy, cv2, PIL, torch, torchvision, ultralytics; print('backend imports OK')"
+python -c "import platform, torch; print(platform.machine(), torch.__version__, 'CUDA:', torch.cuda.is_available())"
 ```
-You should see `Name: fastapi` and a version number.
+The first command must print `backend imports OK`. On a Raspberry Pi CPU install,
+`CUDA: False` is expected.
 
 ---
 
 ## B8. Fix the Admin Password (Linux)
 
 ```bash
-# Make sure (venv) is active and you are in /var/www/html/CGI
+# Make sure (venv) is active and you are in /var/www/html/CGI-V2
 python database/reset_admin.py
 ```
 
@@ -671,7 +711,7 @@ Done. Login credentials:
 Open a terminal and keep it running:
 
 ```bash
-cd /var/www/html/CGI/backend
+cd /var/www/html/CGI-V2/backend
 source ../venv/bin/activate
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -687,7 +727,7 @@ INFO:     Application startup complete.
 A service file is already included at `deployment/cgi-backend.service`. Install it:
 
 ```bash
-sudo cp /var/www/html/CGI/deployment/cgi-backend.service /etc/systemd/system/
+sudo cp /var/www/html/CGI-V2/deployment/cgi-backend.service /etc/systemd/system/
 ```
 
 Edit the service file to match your paths if needed:
@@ -747,7 +787,7 @@ This lists all API endpoints and lets you test them directly from the browser.
 
 **Windows** — create `D:\xampp\htdocs\CGI\frontend\test_api.php`:
 
-**Linux** — create `/var/www/html/CGI/frontend/test_api.php`:
+**Linux** — create `/var/www/html/CGI-V2/frontend/test_api.php`:
 
 ```php
 <?php
@@ -803,11 +843,11 @@ backend starts normally but any inspection attempt will return a FileNotFoundErr
 ### Place the model file
 
 - **Windows:** `D:\xampp\htdocs\CGI\models\cgi_yolov8.pt`
-- **Linux:** `/var/www/html/CGI/models/cgi_yolov8.pt`
+- **Linux:** `/var/www/html/CGI-V2/models/cgi_yolov8.pt`
 
 ```bash
 # Linux — copy from a USB drive or SCP from another machine:
-cp /media/usb/cgi_yolov8.pt /var/www/html/CGI/models/cgi_yolov8.pt
+cp /media/usb/cgi_yolov8.pt /var/www/html/CGI-V2/models/cgi_yolov8.pt
 ```
 
 ### Required class labels
@@ -843,7 +883,7 @@ python -c "from services.detection import _get_model; _get_model(); print('Model
 
 **Linux:**
 ```bash
-cd /var/www/html/CGI/backend
+cd /var/www/html/CGI-V2/backend
 source ../venv/bin/activate
 python -c "from services.detection import _get_model; _get_model(); print('Model loaded OK')"
 ```
@@ -940,7 +980,7 @@ scp -r D:\xampp\htdocs\CGI\pi_node pi@192.168.1.x:/home/pi/CGI/
 
 **From Linux (terminal):**
 ```bash
-scp -r /var/www/html/CGI/pi_node pi@192.168.1.x:/home/pi/CGI/
+scp -r /var/www/html/CGI-V2/pi_node pi@192.168.1.x:/home/pi/CGI/
 ```
 
 Alternatively use **WinSCP** (Windows GUI, https://winscp.net) or `rsync` (Linux) to
@@ -1144,7 +1184,7 @@ python database\reset_admin.py
 
 **Linux fix:**
 ```bash
-cd /var/www/html/CGI
+cd /var/www/html/CGI-V2
 source venv/bin/activate
 python database/reset_admin.py
 ```
@@ -1206,7 +1246,7 @@ uvicorn main:app --reload
 
 **Linux fix:**
 ```bash
-cd /var/www/html/CGI
+cd /var/www/html/CGI-V2
 source venv/bin/activate
 pip install -r backend/requirements.txt
 cd backend
@@ -1220,7 +1260,7 @@ uvicorn main:app --reload
 The trained YOLOv8 model file is missing.
 
 - **Windows:** place at `D:\xampp\htdocs\CGI\models\cgi_yolov8.pt`
-- **Linux:** place at `/var/www/html/CGI/models/cgi_yolov8.pt`
+- **Linux:** place at `/var/www/html/CGI-V2/models/cgi_yolov8.pt`
 
 The backend and all other features still work — only the inspection analyze endpoint
 is unavailable until the model is placed.
@@ -1349,7 +1389,7 @@ Services (should already be running on boot if enabled)
 
 Backend (if running manually)
 [ ] Open a terminal
-[ ] cd /var/www/html/CGI/backend
+[ ] cd /var/www/html/CGI-V2/backend
 [ ] source ../venv/bin/activate
 [ ] uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 [ ] Keep this terminal open

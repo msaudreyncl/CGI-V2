@@ -3,6 +3,10 @@
 **Target OS:** Raspberry Pi OS Bookworm 64-bit (Debian 12)  
 **Hardware:** Raspberry Pi 4 or 5, Pi Camera Module 3, HX711 load cell amplifier
 
+Use the OS-provided Python 3.11 for this environment. Do not create this venv
+with a separately installed Python 3.13: apt-installed Picamera2/libcamera modules
+are built for the OS Python ABI and may not be importable from it.
+
 ---
 
 ## Why a two-phase install is required
@@ -66,6 +70,10 @@ python3 -c "import requests; print('requests OK')"
 ```
 
 All four lines must print `OK` with no errors before proceeding.
+
+The current `pi_node` source has no DHT22 import or reader service. If a DHT22 is
+added later, install the driver against the same OS Python/venv and add a hardware
+smoke test here; no unused DHT package is installed by this project today.
 
 ---
 

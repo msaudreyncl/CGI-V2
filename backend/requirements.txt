@@ -1,5 +1,7 @@
 # Web framework
 fastapi==0.111.0
+pydantic==2.7.1
+starlette==0.37.2
 uvicorn[standard]==0.29.0
 
 # Database
@@ -16,11 +18,18 @@ python-multipart==0.0.9
 python-dotenv==1.0.1
 
 # HTTP client (async, for pricing API)
-httpx2==2.13.1
+httpx==0.27.0
 
 # YOLOv8 / Computer Vision
+# These versions have pre-built CPython 3.11 manylinux2014 ARM64 wheels.
+# Keep NumPy below 2 for the 2024 Ultralytics/OpenCV stack.
 ultralytics==8.2.18
-opencv-python-headless==4.9.0.80
+torch==2.2.2
+torchvision==0.17.2
+numpy==1.26.4
+# Ultralytics declares opencv-python (not opencv-python-headless). Installing both
+# distributions makes them overwrite the same cv2 package, so use only this one.
+opencv-python==4.9.0.80
 Pillow==10.3.0
 
 # Reports
