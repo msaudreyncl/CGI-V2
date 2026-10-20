@@ -1,12 +1,24 @@
-# Raspberry Pi sensor node dependencies
-# Install on the Pi with: pip install -r requirements.txt
+# Raspberry Pi sensor node — pip-installable dependencies only
+#
+# picamera2 and RPi.GPIO are NOT on PyPI. Install them via apt FIRST:
+#
+#   sudo apt update
+#   sudo apt install -y python3-picamera2 python3-rpi.gpio python3-libcamera
+#
+# Then create the virtual environment with system-site-packages access
+# so the apt-installed packages are visible inside it:
+#
+#   python3 -m venv --system-site-packages venv
+#   source venv/bin/activate
+#
+# Only then install this file:
+#
+#   pip install -r requirements.txt
+#
+# See pi_node/INSTALL.md for the full step-by-step procedure.
 
-# GPIO + HX711
-RPi.GPIO==0.7.1
+# HX711 load cell amplifier (pure-Python; safe to install via pip)
 hx711==1.1.2.3
 
-# Pi Camera Module 3 (libcamera-based)
-picamera2==0.3.19
-
-# HTTP client to POST data to backend
+# HTTP client to POST sensor data to the CGI backend
 requests==2.31.0
