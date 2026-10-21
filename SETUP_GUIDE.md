@@ -3,7 +3,7 @@
 This guide covers setting up the full CGI system from scratch on either a
 **Windows machine (XAMPP)** or a **Linux machine (Raspberry Pi OS / Debian/Ubuntu)**.
 Follow the section that matches your server environment, then continue from
-Section 12 onward — those sections apply to both platforms.
+Section 10 onward — those sections apply to both platforms.
 
 ---
 
@@ -23,8 +23,8 @@ Section 12 onward — those sections apply to both platforms.
 
 - [Part B — Linux Server (Raspberry Pi OS / Debian / Ubuntu)](#part-b--linux-server-raspberry-pi-os--debian--ubuntu)
   - [B1. System Requirements (Linux)](#b1-system-requirements-linux)
-  - [B2. Project Folder Placement (Linux)](#b2-project-folder-placement-linux)
-  - [B3. Install Apache, MySQL, and PHP](#b3-install-apache-mysql-and-php)
+  - [B2. Update Raspberry Pi OS and Install Services](#b2-update-raspberry-pi-os-and-install-services)
+  - [B3. Clone the Project and Configure Apache](#b3-clone-the-project-and-configure-apache)
   - [B4. Database Setup (Linux)](#b4-database-setup-linux)
   - [B5. Environment Configuration (Linux)](#b5-environment-configuration-linux)
   - [B6. Python Virtual Environment (Linux)](#b6-python-virtual-environment-linux)
@@ -384,206 +384,352 @@ INFO:     Application startup complete.
 
 ---
 
-## B2. Project Folder Placement (Linux)
+## B2. Update Raspberry Pi OS and Install Services
 
-The CGI project must live inside Apache's web root so it can serve the PHP files.
+The working deployment uses Raspberry Pi OS Bookworm 64-bit, the Linux account
+`cgi`, Apache's default site, and `/var/www/html/CGI-V2`. Run these steps on the Pi.
+For an existing installation, skip packages and initialization already completed;
+do not overwrite `.env` or re-import seed data.
 
-**Default Apache web root:** `/var/www/html/`
-
-**Place the project at:** `/var/www/html/CGI-V2/`
-
-**Clone from GitHub:**
-```bash
-cd /var/www/html
-sudo git clone https://github.com/YOUR_ORG/CGI.git CGI-V2
-sudo chown -R $USER:www-data CGI-V2
-sudo chmod -R 755 CGI-V2
-```
-
-Or copy files manually via SCP/SFTP.
-
-Correct structure inside `/var/www/html/`:
-```
-html/
-└── CGI/
-    ├── backend/
-    ├── frontend/
-    ├── database/
-    ├── models/
-    ├── pi_node/
-    ├── deployment/
-    ├── .env.example
-    ├── README.md
-    └── SETUP_GUIDE.md
-```
-
----
-
-## B3. Install Apache, MySQL, and PHP
+### Update and upgrade the OS
 
 ```bash
-sudo apt update && sudo apt upgrade -y
-
-# Apache web server
-sudo apt install -y apache2
-
-# MySQL (or MariaDB — fully compatible)
-sudo apt install -y mysql-server
-
-# PHP and required extensions
-sudo apt install -y php php-mysql php-curl php-json php-mbstring libapache2-mod-php
-
-# Python and pip
-sudo apt install -y python3 python3-pip python3-venv python3-dev libgl1 libglib2.0-0
-
-# Git (if not already installed)
-sudo apt install -y git
+sudo apt update
+sudo apt full-upgrade -y
 ```
 
-### Enable and start services
+Expect package lists to finish without errors and upgrades to complete. Reboot
+if kernel updates require it, then reconnect before continuing:
 
 ```bash
-sudo systemctl enable apache2 mysql
-sudo systemctl start apache2 mysql
+sudo reboot
 ```
 
-### Secure MySQL (Raspberry Pi OS / Debian)
+This updates the installed OS release; it is not an instruction to change from
+Bookworm to a newer major release. Raspberry Pi recommends `full-upgrade` for
+package dependency updates ([OS documentation](https://www.raspberrypi.com/documentation/computers/os.html)).
+
+### Install Apache2, PHP, MariaDB, Python, and Git
 
 ```bash
-sudo mysql_secure_installation
+sudo apt install -y apache2 mariadb-server mariadb-client
+sudo apt install -y php libapache2-mod-php php-mysql php-curl php-mbstring php-xml php-zip php-gd
+sudo apt install -y python3 python3-pip python3-venv python3-dev libgl1 libglib2.0-0 curl git
+sudo systemctl enable --now apache2 mariadb
+sudo systemctl status apache2 mariadb --no-pager
+php --version
+php -m
+python3 --version
+git --version
 ```
 
-When prompted:
-- Set a root password (remember it — you'll need it for `.env`)
-- Remove anonymous users: **Yes**
-- Disallow root login remotely: **Yes**
-- Remove test database: **Yes**
-- Reload privilege tables: **Yes**
+Both services should show `active (running)`. Expect PHP 8.x, Python 3.11.x,
+and a Git version. PHP modules must include `curl`, `mbstring`, `mysqli`,
+`pdo_mysql`, `xml`, `zip`, `gd`, and `json`. JSON is built into PHP 8; a separate
+`php-json` package is unnecessary here.
 
-> **Note:** On Raspberry Pi OS the default MySQL auth plugin for root uses
-> `auth_socket`, which means you must use `sudo mysql` without a password locally.
-> If you plan to connect from Python via `pymysql`, create a dedicated database user
-> (Step B4b below).
-
-### Enable Apache mod_rewrite (needed for PHP routing)
+Find the Pi's LAN address:
 
 ```bash
-sudo a2enmod rewrite
+hostname -I
+```
+
+Use its LAN IP in place of `<PI_IP>` in browser URLs throughout this guide.
+`http://<PI_IP>/` should initially show Apache's default page.
+
+### Secure MariaDB
+
+```bash
+sudo mariadb-secure-installation
+```
+
+On a fresh installation, press Enter for the current root password. Retain
+`unix_socket` authentication (answer Yes if asked to switch to it), and answer
+No to changing the root password when socket authentication is already enabled.
+Answer Yes to removing anonymous users, disallowing remote root login, removing
+the test database, and reloading privileges. Prompts vary by installed version.
+
+Use `sudo mysql` for local database administration. Do not put the database root
+account in `.env` or use it for phpMyAdmin browser login. MariaDB's default root
+socket authentication does not need a root password
+([MariaDB security documentation](https://mariadb.com/docs/server/clients-and-utilities/deployment-tools/mariadb-secure-installation)).
+
+### Install and configure phpMyAdmin
+
+```bash
+sudo apt install -y phpmyadmin
+```
+
+In the installer, use **Space** to select `apache2`, then Tab and Enter to confirm.
+Choose Yes for configuration with `dbconfig-common`; choose and confirm the
+phpMyAdmin internal database password when prompted. This internal account is
+separate from the CGI database account created in B4.
+
+Ensure Apache loads the packaged configuration:
+
+```bash
+ls -l /etc/apache2/conf-available/phpmyadmin.conf
+```
+
+If that file is missing, link the package configuration once:
+
+```bash
+sudo ln -s /etc/phpmyadmin/apache.conf /etc/apache2/conf-available/phpmyadmin.conf
+```
+
+Then enable it:
+
+```bash
+sudo a2enconf phpmyadmin
+sudo apache2ctl configtest
+```
+
+Continue only after `Syntax OK`:
+
+```bash
 sudo systemctl restart apache2
 ```
 
-### Configure the Apache frontend and API proxy (one time)
+Open `http://<PI_IP>/phpmyadmin/`; the phpMyAdmin login page should appear.
+Log in using `cgi_admin` after B4. Debian packages keep phpMyAdmin settings under
+`/etc/phpmyadmin/` ([installation documentation](https://docs.phpmyadmin.net/en/latest/setup.html)).
 
-Use the included virtual host to serve the PHP frontend and forward `/api/`
-and `/static/` requests to FastAPI:
+---
+
+## B3. Clone the Project and Configure Apache
+
+### Configure Git and clone the repository
+
+Replace the Git author placeholders with your own details:
+
+```bash
+git config --global user.name "YOUR_NAME"
+git config --global user.email "YOUR_EMAIL"
+git config --global --list
+sudo mkdir -p /var/www/html/CGI-V2
+sudo chown "$USER":www-data /var/www/html/CGI-V2
+git clone https://github.com/msaudreyncl/CGI-V2.git /var/www/html/CGI-V2
+cd /var/www/html/CGI-V2
+```
+
+Clone only into an empty directory. If the project already exists, skip the
+`mkdir`, `chown`, and clone commands above and inspect it instead:
 
 ```bash
 cd /var/www/html/CGI-V2
-sudo cp deployment/apache-frontend.conf /etc/apache2/sites-available/cgi.conf
-sudo a2ensite cgi
-sudo a2enmod proxy proxy_http
-sudo apache2ctl configtest
-sudo systemctl reload apache2
+git status
+git remote -v
 ```
 
-The configuration check should report `Syntax OK` before you reload Apache.
-The virtual host uses `/var/www/html/CGI-V2/frontend` as its document root.
+The origin should be `https://github.com/msaudreyncl/CGI-V2.git`.
 
-Edit the hosts file on the computer where you open the browser:
+### Project ownership and permissions
+
+Run as the deployment user (`cgi` on this Pi):
 
 ```bash
-sudo nano /etc/hosts
+sudo chown -R "$USER":www-data /var/www/html/CGI-V2
+sudo chmod -R u+rwX,g+rX,o-rwx /var/www/html/CGI-V2
+mkdir -p backend/static/uploads
+chmod 2770 backend/static/uploads
 ```
 
-For a browser on the Ubuntu server itself, add:
+The owner can edit the project and Apache's `www-data` group can read it.
+The uploads directory is writable by the deployment user and `www-data`.
+Do not use `chmod -R 777`. Restrict `.env` separately in B5.
+
+Expected project structure:
 
 ```text
-127.0.0.1 cgi.local
+/var/www/html/CGI-V2/
+├── backend/
+├── frontend/
+├── database/
+├── models/
+├── pi_node/
+├── deployment/
+├── .env.example
+├── README.md
+└── SETUP_GUIDE.md
 ```
 
-Save with Ctrl+X → Y → Enter. For another computer on your LAN, map `cgi.local`
-to the Ubuntu server's LAN IP instead of `127.0.0.1` in that computer's hosts file.
+### Configure the working default Apache site and reverse proxy
 
-Once the database and backend are ready, open **http://cgi.local**.
-Browser API requests use this same address through Apache's proxy; PHP uses the
-internal backend URL `http://localhost:8000`. Keep browser requests on `/api/`
-so account updates do not require cross-origin requests.
+Identify the active site:
+
+```bash
+sudo apache2ctl -S
+```
+
+For this deployment, expect a line like:
+
+```text
+*:80  127.0.1.1 (/etc/apache2/sites-enabled/000-default.conf:1)
+```
+
+Edit the corresponding site configuration:
+
+```bash
+sudo nano /etc/apache2/sites-available/000-default.conf
+```
+
+Keep the existing `DocumentRoot /var/www/html`. Inside the existing
+`<VirtualHost *:80>` block, before `</VirtualHost>`, add these rules once:
+
+```apache
+ProxyPass        /api/ http://127.0.0.1:8000/api/
+ProxyPassReverse /api/ http://127.0.0.1:8000/api/
+
+# Uploaded and annotated images served by FastAPI
+ProxyPass        /static/ http://127.0.0.1:8000/static/
+ProxyPassReverse /static/ http://127.0.0.1:8000/static/
+
+# Serve only the PHP frontend from this project directory
+<Directory /var/www/html/CGI-V2>
+    Require all denied
+</Directory>
+<Directory /var/www/html/CGI-V2/frontend>
+    Require all granted
+    DirectoryIndex index.php
+    Options -Indexes +FollowSymLinks
+</Directory>
+```
+
+The directory rules keep the project's `.env`, source, and Git data outside the
+served frontend. Keep any existing logging directives. Save with Ctrl+O, Enter,
+then Ctrl+X. Do not also enable the separate `deployment/apache-frontend.conf`
+virtual host for this setup: it uses a different document root and URL layout.
+
+Enable the proxy modules, validate, and restart:
+
+```bash
+sudo a2enmod proxy proxy_http
+sudo apache2ctl configtest
+```
+
+Expected: `Syntax OK`. Only then run:
+
+```bash
+sudo systemctl restart apache2
+sudo systemctl status apache2 --no-pager
+```
+
+Expected: `active (running)`. The warning below is **non-blocking** and can appear
+alongside `Syntax OK`; it does not cause the user update failure:
+
+```text
+AH00558: apache2: Could not reliably determine the server's fully qualified domain name
+```
+
+Optionally suppress it by creating `/etc/apache2/conf-available/servername.conf`
+with `sudo nano /etc/apache2/conf-available/servername.conf` and adding:
+
+```apache
+ServerName localhost
+```
+
+Then run `sudo a2enconf servername`, `sudo apache2ctl configtest`, and, after
+`Syntax OK`, `sudo systemctl reload apache2`.
+
+The CGI frontend URL is `http://<PI_IP>/CGI-V2/frontend/login.php`.
+Browser requests to `/api/` now reach FastAPI on port 8000; PHP's server-side
+requests use `http://localhost:8000`. No hosts-file entry is required for IP URLs.
+If you optionally map `cgi.local`, edit `/etc/hosts` on the computer running the
+browser (`sudo nano /etc/hosts` on Linux), add `<PI_IP> cgi.local`, and retain the
+`/CGI-V2/frontend/` path in the URL. A hosts entry does not replace the API proxy.
 
 ---
 
 ## B4. Database Setup (Linux)
 
-### Step B4a — Create the database
+### Step B4a — Create cgi_db and the cgi_admin account
 
-Log in to MySQL:
+`cgi_db` is the database name hard-coded in the supplied SQL files.
+`cgi_admin` below is a MariaDB login for that database, not a different database
+name and not the application's `admin@cgi.local` login.
+
 ```bash
-# On Raspberry Pi OS / Debian — root uses auth_socket, so use sudo:
 sudo mysql
-
-# On Ubuntu with a root password set:
-mysql -u root -p
 ```
 
-Inside the MySQL shell:
-```sql
-CREATE DATABASE cgi_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-```
+Run inside the MariaDB console, replacing `YOUR_STRONG_PASSWORD`:
 
-### Step B4b — Create a dedicated MySQL user
-
-Still inside the MySQL shell:
 ```sql
-CREATE USER 'cgiuser'@'localhost' IDENTIFIED BY 'your_strong_password';
-GRANT ALL PRIVILEGES ON cgi_db.* TO 'cgiuser'@'localhost';
-FLUSH PRIVILEGES;
+CREATE DATABASE IF NOT EXISTS cgi_db
+    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'cgi_admin'@'localhost'
+    IDENTIFIED BY 'YOUR_STRONG_PASSWORD';
+GRANT ALL PRIVILEGES ON cgi_db.* TO 'cgi_admin'@'localhost';
+SHOW GRANTS FOR 'cgi_admin'@'localhost';
 EXIT;
 ```
 
-> Replace `your_strong_password` with a real password. You will put this in `.env`.
+Expect `Query OK` and grants scoped to `cgi_db.*`. `CREATE USER IF NOT EXISTS`
+does not reset an existing password. If repairing an existing login, use
+`ALTER USER 'cgi_admin'@'localhost' IDENTIFIED BY 'YOUR_STRONG_PASSWORD';`
+inside `sudo mysql`, then match that password in `.env`.
 
-### Step B4c — Run schema.sql
+If your existing working installation uses `cgiuser`, keep that account and
+substitute `cgiuser` for `cgi_admin` in the commands and `.env` below. Do not
+rename existing accounts merely to follow this guide.
+
+### Step B4b — Import schema and seed (new installations only)
 
 ```bash
-mysql -u cgiuser -p cgi_db < /var/www/html/CGI-V2/database/schema.sql
+cd /var/www/html/CGI-V2
+sudo mysql cgi_db < database/schema.sql
+sudo mysql cgi_db < database/seed.sql
 ```
 
-Enter the password when prompted. A success exit (no error output) means it worked.
+Successful imports exit without errors. Do not re-import seed data into a
+populated installation. For an existing database, first back up and apply only
+the outstanding migrations in the next step.
 
-Verify the tables were created:
+### Step B4c — Apply required migrations
+
+Back up before upgrading an existing database; confirm the command succeeds:
+
 ```bash
-mysql -u cgiuser -p cgi_db -e "SHOW TABLES;"
+sudo mysqldump --single-transaction cgi_db > "$HOME/cgi_db_before_migrations_$(date +%Y%m%d_%H%M%S).sql"
 ```
 
-Expected output:
+Both fresh installations and older schemas need these migrations, in order:
+
+```bash
+sudo mysql cgi_db < database/migrations/001_six_stage_workflow.sql
+sudo mysql cgi_db < database/migrations/002_user_management.sql
 ```
+
+Stop if an import reports an error. These files use MariaDB's
+`ADD COLUMN IF NOT EXISTS`; do not assume the same syntax works on MySQL 8.
+They add workflow columns, `pending_transactions`, and user display/login fields.
+
+### Step B4d — Verify the account and database over TCP
+
+```bash
+mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u cgi_admin -p cgi_db -e "SELECT CURRENT_USER(); SHOW TABLES;"
+mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u cgi_admin -p cgi_db -e "SELECT id, name, email, role FROM users;"
+```
+
+Enter the account password when prompted. Expect these eight tables:
+
+```text
 cooperatives
 defect_results
 farmers
 inspections
+pending_transactions
 pricing_config
 transactions
 users
 ```
 
-### Step B4d — Run seed.sql
+A freshly seeded database has `id=1`, `System Admin`, `admin@cgi.local`, role
+`admin`. Existing databases may have additional users.
 
-```bash
-mysql -u cgiuser -p cgi_db < /var/www/html/CGI-V2/database/seed.sql
-```
-
-Verify:
-```bash
-mysql -u cgiuser -p cgi_db -e "SELECT id, name, email, role FROM users;"
-```
-
-Expected:
-```
-+----+--------------+-----------------+-------+
-| id | name         | email           | role  |
-+----+--------------+-----------------+-------+
-|  1 | System Admin | admin@cgi.local | admin |
-+----+--------------+-----------------+-------+
-```
+Open `http://<PI_IP>/phpmyadmin/` and log in with `cgi_admin` and its database
+password. Select `cgi_db`, inspect the eight tables, and browse `users` to verify
+the same data. The phpMyAdmin internal account is not the CGI login.
 
 ---
 
@@ -591,7 +737,9 @@ Expected:
 
 ```bash
 cd /var/www/html/CGI-V2
-cp .env.example .env
+# Copy only if .env does not already exist
+[ -f .env ] || cp .env.example .env
+chmod 640 .env
 nano .env
 ```
 
@@ -604,15 +752,15 @@ APP_HOST=0.0.0.0
 APP_PORT=8000
 APP_DEBUG=true
 
-# Database — use the dedicated user created in Step B4b
-DB_HOST=localhost
+# Database — use the dedicated user created in Step B4a
+DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_NAME=cgi_db
-DB_USER=cgiuser
-DB_PASSWORD=your_strong_password
+DB_USER=cgi_admin
+DB_PASSWORD="YOUR_STRONG_PASSWORD"
 
-# JWT — change this to any long random string
-JWT_SECRET=cgi-thesis-2024-change-this-string
+# JWT — generate using: python3 -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET=REPLACE_WITH_GENERATED_SECRET
 JWT_ALGORITHM=HS256
 JWT_EXPIRE_MINUTES=480
 
@@ -642,7 +790,8 @@ THERMAL_PRINTER_PORT=9100
 CORS_ORIGINS=http://localhost,http://127.0.0.1
 ```
 
-Save with Ctrl+X → Y → Enter.
+Save with Ctrl+X → Y → Enter. Match the database account and password from B4.
+Keep the existing working credentials when updating an installation.
 
 ---
 
@@ -708,7 +857,7 @@ python database/reset_admin.py
 
 Expected output:
 ```
-Connecting to MySQL at localhost:3306/cgi_db...
+Connecting to MySQL at 127.0.0.1:3306/cgi_db...
 Generated hash for 'Admin@1234'
 Updated existing admin user (id=1)
 
@@ -726,9 +875,10 @@ Done. Login credentials:
 Open a terminal and keep it running:
 
 ```bash
-cd /var/www/html/CGI-V2/backend
-source ../venv/bin/activate
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+cd /var/www/html/CGI-V2
+source venv/bin/activate
+python backend/database.py
+python -m uvicorn main:app --app-dir backend --host 0.0.0.0 --port 8000 --reload
 ```
 
 Expected output:
@@ -737,8 +887,19 @@ INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 INFO:     Application startup complete.
 ```
 
+The database check must report:
+
+```text
+Database connectivity and required tables/columns OK (read-only check).
+```
+
+Keep the terminal open. Ctrl+C stops the backend; Apache alone cannot serve API
+requests. `--app-dir backend` is required when starting from the project root.
+The reload flag is for development and restarts the server when source changes.
+
 ### Option 2 — systemd service (production / auto-start on boot)
 
+Do not run the manual server and systemd service simultaneously on port 8000.
 A service file is already included at `deployment/cgi-backend.service`. Install it:
 
 ```bash
@@ -775,14 +936,41 @@ For Linux, replace `localhost` with your server's IP address if accessing from a
 ### Check MySQL / MariaDB
 
 - **Windows:** Open `http://localhost/phpmyadmin` — phpMyAdmin should load.
-- **Linux:** Run `mysql -u cgiuser -p cgi_db -e "SELECT COUNT(*) FROM users;"` — should return `1`.
+- **Linux:** Run `mysql --protocol=TCP -h 127.0.0.1 -u cgi_admin -p cgi_db -e "SELECT COUNT(*) FROM users;"`. A fresh seed returns `1`; an existing installation can return more. Use `cgiuser` instead if retaining that account.
 
 ### Check Apache
 
 On Windows, open `http://localhost` — the Apache default page should appear.
-On Linux, open `http://cgi.local` — the CGI login page should appear.
-Also open `http://cgi.local/api/health` after starting FastAPI to verify the Apache
-API proxy returns the health response below.
+On Raspberry Pi OS, open `http://<PI_IP>/CGI-V2/frontend/login.php`.
+Apache's document root remains `/var/www/html`; visiting `/` may show its default page.
+
+### Check the Apache-to-FastAPI proxy (Raspberry Pi)
+
+With Uvicorn running in its dedicated terminal, open a second terminal:
+
+```bash
+curl -i http://127.0.0.1/api/health
+```
+
+Expected response (header order and date may vary):
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"status":"ok","version":"1.0.0"}
+```
+
+This uses port 80 and verifies Apache forwarding, not just direct port 8000 access.
+From another computer, open `http://<PI_IP>/api/health` and expect the same JSON.
+If this fails, compare with `curl -i http://127.0.0.1:8000/api/health` on the Pi.
+If port 8000 works but port 80 fails, check the active default-site proxy in B3.
+
+### Check phpMyAdmin (Raspberry Pi)
+
+Open `http://<PI_IP>/phpmyadmin/`. Log in with the database account from B4,
+select `cgi_db`, and confirm its tables and users. This login differs from the
+CGI application's email/password login.
 
 ### Check FastAPI backend
 
@@ -817,7 +1005,7 @@ echo "HTTP $code: $result";
 ```
 
 Open `http://localhost/CGI/frontend/test_api.php` on Windows or
-`http://cgi.local/test_api.php` on Linux.
+`http://<PI_IP>/CGI-V2/frontend/test_api.php` on Linux.
 
 Expected: `HTTP 200: {"status":"ok","version":"1.0.0"}`
 
@@ -830,7 +1018,7 @@ Delete this file after testing.
 Open your browser and go to:
 
 - **Windows (XAMPP):** `http://localhost/CGI/frontend/login.php`
-- **Ubuntu / Linux (configured virtual host):** `http://cgi.local/login.php`
+- **Raspberry Pi OS / Linux (default site):** `http://<PI_IP>/CGI-V2/frontend/login.php`
 
 Default admin credentials:
 
@@ -841,7 +1029,9 @@ Default admin credentials:
 
 After a successful login you will be redirected to the **Dashboard**.
 
-> Change the admin password after first login.
+> The original System Admin (id 1) is protected from modification through the
+> Users page. The reset script restores its documented default credentials;
+> use additional admin accounts for normal account management.
 
 ### If login does not work
 
@@ -1214,7 +1404,8 @@ python database/reset_admin.py
 
 The PHP redirect is sending you to the wrong path.
 
-- Always access the site via `http://localhost/CGI/frontend/login.php`
+- Windows: use `http://localhost/CGI/frontend/login.php`.
+- Raspberry Pi: use `http://<PI_IP>/CGI-V2/frontend/login.php`.
 - Never open PHP files directly as `file:///...` — they must go through Apache
 - Confirm Apache is running
 
@@ -1224,14 +1415,21 @@ The PHP redirect is sending you to the wrong path.
 
 Port 8000 is already used by another process.
 
-Fix — change the port in `.env`:
-```env
-APP_PORT=8001
-```
-Then start with:
+Check whether the optional service already owns port 8000:
+
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+sudo systemctl status cgi-backend --no-pager
+sudo ss -ltnp 'sport = :8000'
 ```
+
+Use the running backend, or stop it before starting a manual instance:
+
+```bash
+sudo systemctl stop cgi-backend
+```
+
+Keep port 8000 for this deployment: Apache's proxy and PHP's backend URL use it.
+Changing `APP_PORT` alone does not change an explicit Uvicorn `--port` argument.
 
 ---
 
@@ -1243,10 +1441,10 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 3. Test: open `D:\xampp\mysql\bin\mysql.exe` → press Enter when asked for password
 
 **Linux checklist:**
-1. Is MySQL/MariaDB running? `sudo systemctl status mysql`
+1. Is MySQL/MariaDB running? `sudo systemctl status mariadb`
 2. Is `DB_USER` and `DB_PASSWORD` in `.env` correct?
-3. Test: `mysql -u cgiuser -p cgi_db` — you should reach the `mysql>` prompt
-4. If using the root socket auth on Raspberry Pi OS, create a dedicated user (Step B4b)
+3. Test: `mysql --protocol=TCP -h 127.0.0.1 -u cgi_admin -p cgi_db` — you should reach the MariaDB prompt
+4. If using the root socket auth on Raspberry Pi OS, create a dedicated user (Step B4a)
 
 ---
 
@@ -1267,9 +1465,8 @@ uvicorn main:app --reload
 ```bash
 cd /var/www/html/CGI-V2
 source venv/bin/activate
-pip install -r backend/requirements.txt
-cd backend
-uvicorn main:app --reload
+python -m pip install --only-binary=:all: -r backend/requirements.txt
+python -m uvicorn main:app --app-dir backend --host 0.0.0.0 --port 8000 --reload
 ```
 
 ---
@@ -1303,20 +1500,60 @@ Fix: Always access through Apache: `http://localhost/CGI/frontend/...`
 
 ---
 
+### Account updates fail with "Update failed (HTTP 405)"
+
+The browser sends `PUT /api/users/{id}` to Apache. If no corresponding PUT appears
+in Uvicorn's log, Apache is likely handling the request without forwarding it.
+Account creation can still work because PHP calls FastAPI directly.
+
+Follow B3: inspect `sudo apache2ctl -S`, add `/api/` proxy rules inside the active
+`000-default.conf` virtual host, enable `proxy proxy_http`, run `configtest`, then
+restart Apache. Verify with the port-80 health check in Section 10. Do not add a
+second virtual host or change `/etc/hosts` to fix a missing proxy.
+
 ### Account updates fail with "Network error: Failed to fetch" / OPTIONS 400
 
-A rejected `OPTIONS /api/users/{id}` request indicates a CORS preflight failure.
-Open the site through `http://cgi.local` and ensure the Apache proxy from B3 is
-configured. Browser API URLs should use `/api/` on the current website origin,
-rather than `http://localhost:8000`. Hard-refresh with Ctrl+Shift+R after updating
-the frontend, then retry the account action.
+A rejected `OPTIONS /api/users/{id}` indicates a CORS preflight failure. Use the
+PHP website through Apache and keep browser API requests on same-origin `/api/`.
+Hard-refresh with Ctrl+Shift+R. For intentional cross-origin requests,
+`CORS_ORIGINS` must contain the exact browser origin (scheme, hostname, port);
+subnet entries such as `http://192.168.1.0/24` are unsupported. Restart the backend
+after editing `.env`.
 
-Check `http://cgi.local/api/health`: it should return HTTP 200. If it fails, verify
-that FastAPI is running and that Apache's `proxy` and `proxy_http` modules and
-`cgi` site are enabled. If direct cross-origin access is intentionally used,
-`CORS_ORIGINS` must contain the exact browser origin (scheme, hostname, and port).
-Subnet entries such as `http://192.168.1.0/24` are not supported. Restart the backend
-after changing `.env`.
+### "Could not import module main"
+
+From `/var/www/html/CGI-V2`, use the B9 command with `--app-dir backend`.
+The entry point is `backend/main.py`, not a root-level `main.py`.
+
+### "Database schema is missing"
+
+Startup checks are read-only and do not upgrade the schema. Back up the database
+and apply the outstanding B4c migrations, then run `python backend/database.py`
+inside the active venv. Do not drop tables or re-import seed data as a repair.
+
+### "Backend returned an invalid JSON response" when adding a user
+
+This means PHP received a non-JSON response, often a backend HTTP 500. Reproduce
+once while watching the Uvicorn traceback. A confirmed historical cause was
+`Duplicate entry 'FF00001' for key 'user_id_display'`: older registration code
+used role counts to allocate display IDs. Use the corrected registration code
+that checks existing IDs across all roles and handles conflicts. Do not delete
+existing users or reset the database to repair it. Other errors need their own
+traceback diagnosis; do not assume every invalid response is an ID collision.
+
+### phpMyAdmin returns 404 or rejects login
+
+For 404, check `/etc/apache2/conf-available/phpmyadmin.conf`, run
+`sudo a2enconf phpmyadmin`, validate Apache, then restart as in B2.
+For access denied, use the database account/password from B4, not the application
+email/password or MariaDB's socket-authenticated root account. Test the same
+credentials over TCP using B4d.
+
+### Apache warns AH00558 about ServerName
+
+This warning is non-blocking if `configtest` also reports `Syntax OK`.
+The optional global `ServerName localhost` configuration in B3 suppresses it.
+An actual syntax error must be fixed before restarting Apache.
 
 ### The web page cannot reach the backend — curl error or empty response from API
 
@@ -1418,15 +1655,16 @@ To stop
 
 ```
 Services (should already be running on boot if enabled)
-[ ] sudo systemctl start apache2 mysql
+[ ] sudo systemctl start apache2 mariadb
 [ ] sudo systemctl status apache2    — must be active
-[ ] sudo systemctl status mysql      — must be active
+[ ] sudo systemctl status mariadb    — must be active
 
 Backend (if running manually)
 [ ] Open a terminal
-[ ] cd /var/www/html/CGI-V2/backend
-[ ] source ../venv/bin/activate
-[ ] uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+[ ] cd /var/www/html/CGI-V2
+[ ] source venv/bin/activate
+[ ] python backend/database.py
+[ ] python -m uvicorn main:app --app-dir backend --host 0.0.0.0 --port 8000 --reload
 [ ] Keep this terminal open
 
 Backend (if running as systemd service)
@@ -1434,7 +1672,9 @@ Backend (if running as systemd service)
 [ ] sudo systemctl status cgi-backend   — must show "active (running)"
 
 Browser
-[ ] Open http://cgi.local/login.php
+[ ] curl -i http://127.0.0.1/api/health — must return HTTP 200
+[ ] Open http://<PI_IP>/CGI-V2/frontend/login.php
+[ ] Verify http://<PI_IP>/phpmyadmin/ when database administration is needed
 [ ] Log in with your credentials
 
 To stop (manual mode)
