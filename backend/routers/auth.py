@@ -3,6 +3,7 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -23,8 +24,17 @@ _ROLE_PREFIX = {
 def _generate_display_id(role: UserRole, db: Session) -> str:
     """Return the next sequential role-prefixed display ID (e.g. 'FF00003')."""
     prefix = _ROLE_PREFIX[role]
-    count = db.query(User).filter(User.role == role).count()
-    return f"{prefix}{count + 1:05d}"
+    # Display IDs survive role changes; inspect all accounts, not current roles.
+    existing = db.query(User.user_id_display).filter(
+        User.user_id_display.like(f"{prefix}%")
+    ).all()
+    highest = max(
+        (int(value[len(prefix):]) for (value,) in existing
+         if value and value[len(prefix):].isascii()
+         and value[len(prefix):].isdigit()),
+        default=0,
+    )
+    return f"{prefix}{highest + 1:05d}"
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -55,15 +65,29 @@ def register(
 ):
     if db.query(User).filter(User.email == body.email).first():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered.")
-    display_id = _generate_display_id(body.role, db)
-    user = User(
-        user_id_display=display_id,
-        name=body.name,
-        email=body.email,
-        password_hash=hash_password(body.password),
-        role=body.role,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return UserOut.model_validate(user)
+    password_hash = hash_password(body.password)
+    for attempt in range(3):
+        user = User(
+            user_id_display=_generate_display_id(body.role, db),
+            name=body.name,
+            email=body.email,
+            password_hash=password_hash,
+            role=body.role,
+        )
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError:
+            # End the failed transaction before checking concurrent registrations.
+            db.rollback()
+            if db.query(User).filter(User.email == body.email).first():
+                raise HTTPException(status_code=409, detail="Email already registered.")
+            if attempt == 2:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Could not allocate a unique user ID. Please try again.",
+                )
+            db.rollback()
+            continue
+        db.refresh(user)
+        return UserOut.model_validate(user)
