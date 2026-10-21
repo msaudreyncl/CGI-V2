@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from config import get_settings
-from database import create_tables
+from database import check_database, engine
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 from routers.auth                 import router as auth_router
@@ -33,9 +33,11 @@ async def lifespan(app: FastAPI):
     """Run startup tasks before yielding to the application."""
     # Ensure upload directory exists
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    # Auto-create tables (idempotent)
-    create_tables()
-    yield
+    check_database()
+    try:
+        yield
+    finally:
+        engine.dispose()
 
 
 app = FastAPI(
@@ -58,7 +60,8 @@ app.add_middleware(
 )
 
 # ── Static files (uploaded images) ───────────────────────────────────────────
-app.mount("/static", StaticFiles(directory=BACKEND_DIR / "static"), name="static")
+app.mount("/static/uploads", StaticFiles(directory=settings.UPLOAD_DIR, check_dir=False), name="uploads")
+app.mount("/static", StaticFiles(directory=BACKEND_DIR / "static", check_dir=False), name="static")
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth_router)

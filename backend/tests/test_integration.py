@@ -1,7 +1,7 @@
 """
 tests/test_integration.py — End-to-end integration tests for the CGI backend.
 
-These tests spin up a TestClient (no live database required) using SQLite in-memory
+These tests spin up a TestClient (no live database required) using temporary SQLite
 so they run on any machine without MySQL.  They cover the full happy-path flow:
 
   register/login → create cooperative & farmer → submit inspection (mocked detection)
@@ -48,7 +48,7 @@ sys.modules.setdefault("escpos.printer", printer_stub)
 from database import Base, get_db
 import tempfile, pathlib
 
-_TEST_DB_FILE = pathlib.Path(__file__).parent / "test_run.db"
+_TEST_DB_FILE = pathlib.Path(tempfile.mkdtemp(prefix="cgi-tests-")) / "test_run.db"
 TEST_DATABASE_URL = f"sqlite:///{_TEST_DB_FILE}"
 
 _engine      = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
@@ -66,13 +66,13 @@ def _override_get_db():
 @pytest.fixture(scope="module")
 def client():
     """
-    Integration test client using SQLite in-memory database.
+    Integration test client using a temporary SQLite database.
 
     Strategy:
     1. Swap database.engine to SQLite before the app's lifespan fires.
     2. Create all tables on the SQLite engine directly.
     3. Override get_db to use the SQLite session.
-    4. TestClient starts the app (lifespan runs create_tables — now hits SQLite).
+    4. TestClient starts the app (lifespan validates the isolated SQLite schema).
     """
     import database as db_module
 
@@ -87,13 +87,13 @@ def client():
     import models.user, models.cooperative, models.farmer  # noqa
     import models.inspection, models.defect_result         # noqa
     import models.pricing_config, models.transaction       # noqa
-    Base.metadata.create_all(bind=_engine)
+    db_module.create_tables()
 
     from main import app
     # 3. Override get_db
     app.dependency_overrides[get_db] = _override_get_db
 
-    # 4. Start app (lifespan calls create_tables which now hits SQLite — idempotent)
+    # 4. Start app (lifespan checks the isolated schema without changing it)
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
 

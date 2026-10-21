@@ -1,6 +1,6 @@
 [Unit]
 Description=CGI FastAPI Backend (Uvicorn)
-After=network.target mysql.service
+After=network.target mariadb.service
 
 [Service]
 Type=simple

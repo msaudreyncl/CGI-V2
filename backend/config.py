@@ -20,10 +20,10 @@ class Settings:
     APP_DEBUG: bool  = os.getenv("APP_DEBUG", "true").lower() == "true"
 
     # Database
-    DB_HOST:     str = os.getenv("DB_HOST", "localhost")
+    DB_HOST:     str = os.getenv("DB_HOST", "127.0.0.1")
     DB_PORT:     int = int(os.getenv("DB_PORT", "3306"))
     DB_NAME:     str = os.getenv("DB_NAME", "cgi_db")
-    DB_USER:     str = os.getenv("DB_USER", "root")
+    DB_USER:     str = os.getenv("DB_USER", "cgi_app")
     DB_PASSWORD: str = os.getenv("DB_PASSWORD", "")
 
     @property

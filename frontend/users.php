@@ -590,7 +590,9 @@ $stat_cards = [
 
 <script>
     window.CGI_BASE = <?= json_encode(APP_BASE) ?>;
-    window.CGI_API_BASE = <?= json_encode(API_BASE) ?>;
+    // Browser requests use Apache's /api/ proxy on the current origin.
+    // API_BASE is the internal backend URL used by PHP only.
+    window.CGI_API_BASE = '';
 </script>
 
 <script src="<?= users_escape(APP_BASE) ?>/assets/js/navbar.js?v=3"></script>

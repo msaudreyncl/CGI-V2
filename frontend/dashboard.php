@@ -592,7 +592,7 @@ if ($role !== 'farmer') {
 <script src="<?= APP_BASE ?>/assets/js/navbar.js?v=3"></script>
 <script src="<?= APP_BASE ?>/assets/js/dashboard.js?v=1"
         data-app-base="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>"
-        data-api-base="<?= htmlspecialchars(API_BASE, ENT_QUOTES, 'UTF-8') ?>"></script>
+        data-api-base=""></script>
 <script src="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>/assets/js/api.js"></script>
 </body>
 </html>
