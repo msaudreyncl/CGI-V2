@@ -472,27 +472,42 @@ sudo a2enmod rewrite
 sudo systemctl restart apache2
 ```
 
-### Allow Apache to serve from `/var/www/html/CGI-V2/`
+### Configure the Apache frontend and API proxy (one time)
 
-Edit the default site config to allow `.htaccess` overrides:
+Use the included virtual host to serve the PHP frontend and forward `/api/`
+and `/static/` requests to FastAPI:
 
 ```bash
-sudo nano /etc/apache2/sites-available/000-default.conf
+cd /var/www/html/CGI-V2
+sudo cp deployment/apache-frontend.conf /etc/apache2/sites-available/cgi.conf
+sudo a2ensite cgi
+sudo a2enmod proxy proxy_http
+sudo apache2ctl configtest
+sudo systemctl reload apache2
 ```
 
-Add or update the `<Directory>` block inside `<VirtualHost>`:
+The configuration check should report `Syntax OK` before you reload Apache.
+The virtual host uses `/var/www/html/CGI-V2/frontend` as its document root.
 
-```apache
-<Directory /var/www/html>
-    AllowOverride All
-    Require all granted
-</Directory>
-```
+Edit the hosts file on the computer where you open the browser:
 
-Save (Ctrl+X → Y → Enter), then:
 ```bash
-sudo systemctl restart apache2
+sudo nano /etc/hosts
 ```
+
+For a browser on the Ubuntu server itself, add:
+
+```text
+127.0.0.1 cgi.local
+```
+
+Save with Ctrl+X → Y → Enter. For another computer on your LAN, map `cgi.local`
+to the Ubuntu server's LAN IP instead of `127.0.0.1` in that computer's hosts file.
+
+Once the database and backend are ready, open **http://cgi.local**.
+Browser API requests use this same address through Apache's proxy; PHP uses the
+internal backend URL `http://localhost:8000`. Keep browser requests on `/api/`
+so account updates do not require cross-origin requests.
 
 ---
 
@@ -764,7 +779,10 @@ For Linux, replace `localhost` with your server's IP address if accessing from a
 
 ### Check Apache
 
-Open `http://localhost` in a browser — the Apache default page should appear.
+On Windows, open `http://localhost` — the Apache default page should appear.
+On Linux, open `http://cgi.local` — the CGI login page should appear.
+Also open `http://cgi.local/api/health` after starting FastAPI to verify the Apache
+API proxy returns the health response below.
 
 ### Check FastAPI backend
 
@@ -798,7 +816,8 @@ $code   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 echo "HTTP $code: $result";
 ```
 
-Open `http://localhost/CGI/frontend/test_api.php`
+Open `http://localhost/CGI/frontend/test_api.php` on Windows or
+`http://cgi.local/test_api.php` on Linux.
 
 Expected: `HTTP 200: {"status":"ok","version":"1.0.0"}`
 
@@ -809,9 +828,9 @@ Delete this file after testing.
 # 11. Log In to the Web UI
 
 Open your browser and go to:
-```
-http://localhost/CGI/frontend/login.php
-```
+
+- **Windows (XAMPP):** `http://localhost/CGI/frontend/login.php`
+- **Ubuntu / Linux (configured virtual host):** `http://cgi.local/login.php`
 
 Default admin credentials:
 
@@ -1284,6 +1303,21 @@ Fix: Always access through Apache: `http://localhost/CGI/frontend/...`
 
 ---
 
+### Account updates fail with "Network error: Failed to fetch" / OPTIONS 400
+
+A rejected `OPTIONS /api/users/{id}` request indicates a CORS preflight failure.
+Open the site through `http://cgi.local` and ensure the Apache proxy from B3 is
+configured. Browser API URLs should use `/api/` on the current website origin,
+rather than `http://localhost:8000`. Hard-refresh with Ctrl+Shift+R after updating
+the frontend, then retry the account action.
+
+Check `http://cgi.local/api/health`: it should return HTTP 200. If it fails, verify
+that FastAPI is running and that Apache's `proxy` and `proxy_http` modules and
+`cgi` site are enabled. If direct cross-origin access is intentionally used,
+`CORS_ORIGINS` must contain the exact browser origin (scheme, hostname, and port).
+Subnet entries such as `http://192.168.1.0/24` are not supported. Restart the backend
+after changing `.env`.
+
 ### The web page cannot reach the backend — curl error or empty response from API
 
 Checklist:
@@ -1384,6 +1418,7 @@ To stop
 
 ```
 Services (should already be running on boot if enabled)
+[ ] sudo systemctl start apache2 mysql
 [ ] sudo systemctl status apache2    — must be active
 [ ] sudo systemctl status mysql      — must be active
 
@@ -1399,7 +1434,7 @@ Backend (if running as systemd service)
 [ ] sudo systemctl status cgi-backend   — must show "active (running)"
 
 Browser
-[ ] Open http://localhost/CGI/frontend/login.php
+[ ] Open http://cgi.local/login.php
 [ ] Log in with your credentials
 
 To stop (manual mode)
