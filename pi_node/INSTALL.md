@@ -10,7 +10,8 @@ JWT-authenticated FastAPI hardware proxy. The Pi runs **pi_server.py**:
 | GET `/api/hardware/status` | GET `/weight` | Independent camera/scale readiness; printer stays non-blocking |
 | GET `/api/hardware/weight` | GET `/weight` | Grams, consecutive-reading stability (≤0.5 g), 340–360 g range |
 | POST `/api/hardware/weight` `{ "action": "tare" }` | POST `/weight`, same body | Zero the empty tray, save offset |
-| POST `/api/hardware/capture` `{ "view": "A" }` (or B) | POST `/capture` | Picamera2 autofocus + JPEG |
+| POST `/api/hardware/capture` `{ "view": "A" }` (or B) | POST `/capture` | Picamera2 full-resolution JPEG |
+| POST `/api/hardware/capture` `{ "view": "A", "preview": true }` | POST `/capture`, same body | Fresh JPEG preview, maximum 640×360; never saved as A/B |
 | POST `/api/transaction/init` | Existing backend workflow | Creates pending transaction |
 | PUT `/api/transaction/{id}/weight` | Existing backend workflow | Validates and saves grams |
 | POST `/api/inspection/capture-dual` | Existing YOLO service | Analyzes A/B, saves images and inspection/transaction |
@@ -48,12 +49,12 @@ and digital supplies follow the module datasheet and keep the digital supply at 
 ## Install (Pi 4)
 
 These commands assume the deployment path used by the existing service:
-`/home/pi/CGI`. Substitute your checkout path and service user if different.
+`/var/www/html/CGI-V2` and service user `cgi`. Substitute your checkout path and user if different.
 
 ```bash
 sudo apt update
 sudo apt install -y python3-venv python3-picamera2 python3-libcamera python3-rpi.gpio python3-pil rpicam-apps
-cd /home/pi/CGI/pi_node
+cd /var/www/html/CGI-V2/pi_node
 python3 -m venv --system-site-packages venv
 venv/bin/python -m pip install -r requirements.txt
 # Only on a fresh checkout without config.ini:
@@ -84,7 +85,7 @@ architecture; expose port 5000 only on the trusted device/backend network.
 Stop the service before CLI calibration so there is one GPIO owner:
 
 ```bash
-cd /home/pi/CGI/pi_node
+cd /var/www/html/CGI-V2/pi_node
 sudo systemctl stop cgi-node
 CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --calibrate
 ```
@@ -100,7 +101,7 @@ Calibration factor `1.0` is only a placeholder, not a calibrated scale.
 CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py
 # To save only a new empty-tray zero while service is stopped:
 CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --tare
-# Camera smoke test (hardware mode, autofocus, saved JPEG):
+# Camera smoke test (configured focus mode, saved JPEG):
 CGI_HARDWARE_MODE=hardware venv/bin/python camera_capture.py /tmp/cgi-camera.jpg
 ```
 
@@ -113,7 +114,7 @@ zero and a known mass after startup.
 ## Start the touchscreen hardware service
 
 ```bash
-cd /home/pi/CGI/pi_node
+cd /var/www/html/CGI-V2/pi_node
 sudo cp cgi-node.service /etc/systemd/system/cgi-node.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now cgi-node
@@ -135,7 +136,7 @@ hardware; missing drivers or disconnections never trigger dummy data. To explici
 simulate on either host (stop the hardware service first if it owns port 5000):
 
 ```bash
-cd /home/pi/CGI/pi_node
+cd /var/www/html/CGI-V2/pi_node
 CGI_HARDWARE_MODE=simulation venv/bin/python pi_server.py
 ```
 
@@ -145,14 +146,50 @@ hardware, leave dashboard Development Mode **off** and run the simulated Pi serv
 API responses mark simulated readings/captures. These are test images, not meaningful
 YOLO samples.
 
-Scale operations have a 4-second deadline; camera probes 3 seconds and captures
-20 seconds. Failed workers are terminated and reaped before retrying. Each operation
-reopens the device so a repaired connection can recover on retry. Scale and camera
-operations have separate locks. Readiness uses a short (2-second) camera probe cache;
-capture always accesses the camera and reports failures. Scale failures clear stability
-and disable frontend progression; polling never overlaps and ignores outdated responses.
-A stable reading means two consecutive samples differ by at most 0.5 g, not a metrology
-certification. Real HX711 bit timing and accuracy must be checked under deployment load.
+Scale operations have a 4-second deadline; camera readiness has an 8-second
+first-frame deadline and capture/preview requests a 20-second deadline. Failed
+camera workers are terminated and reaped, then recreated on the next request.
+Scale and camera operations have separate locks. Readiness uses a short (2-second)
+cache and verifies an actual JPEG frame rather than only sensor enumeration.
+
+The existing Pi server owns one persistent Picamera2 child process for both live
+preview and still capture. It releases the device after 15 seconds with no camera
+requests, or when the server stops. Stop `cgi-node` before using terminal camera
+tools so there is only one camera owner. No additional service or URL is required.
+The browser requests a fresh preview JPEG 500 ms after the preceding request
+completes (actual refresh rate depends on the Pi and network). Requests do not
+overlap. Preview pauses during the existing countdown/capture, and stops on leaving
+Capture or closing the transaction. Preview frames never replace accepted A/B
+images or enter YOLO. On errors the stale preview is hidden and subsequent requests
+retry the camera; capture failures leave the affected view available for retry.
+
+### Focus configuration for the working camera
+
+In `pi_node/config.ini`, under the existing `[camera]` section:
+
+```ini
+FOCUS_MODE = manual
+LENS_POSITION =
+```
+
+Manual mode is the default when these keys are absent, matching the successful
+terminal `--autofocus-mode manual` test. A blank `LENS_POSITION` preserves the
+camera's initial position; inspect sharpness at the mounted tray distance.
+To set a verified fixed focus, supply a lens position in dioptres (approximately
+1 / distance in metres). Only use `FOCUS_MODE = auto` after the autofocus terminal
+and Picamera2 tests succeed; `auto` focuses before each accepted still, while
+`continuous` keeps autofocus running during preview. Autofocus errors do not
+silently fall back to manual mode. Configuration changes reopen the camera worker
+on the next request; restart the service for a clean deployment.
+
+The browser still sends only the two accepted full-resolution JPEGs and pending
+transaction ID to `/api/inspection/capture-dual`. As before, Analyze persists both
+images and corresponding transaction data through the existing database workflow.
+The standalone `camera-test/` directory is for terminal tests; transaction image
+storage stays in the backend's configured `UPLOAD_DIR`.
+
+A stable weight means two consecutive samples differ by at most 0.5 g, not a
+metrology certification. Verify physical accuracy under deployment load.
 
 ## End-to-end verification on the Pi touchscreen
 
@@ -161,7 +198,8 @@ certification. Real HX711 bit timing and accuracy must be checked under deployme
    printer warning remains non-blocking.
 2. Continue to Weight, tare the empty tray, then place 350 g. Confirm live grams
    stabilize. Below 340 g and above 360 g must block Continue; both boundaries pass.
-3. Continue, capture/accept A, physically reorient the sample, capture/accept B.
+3. Continue and verify the live image changes when you move a hand above the tray.
+   Capture/accept A, physically reorient the sample, then capture/accept B.
    Verify focus, previews, retake, and both accept actions before Analyze.
 4. Analyze with the deployed trained YOLO model. Verify both raw/annotated images,
    transaction number, sample grams and transaction kilograms in results/history.
@@ -198,3 +236,24 @@ with substituted PHP-generated values, Bootstrap modal behavior and API response
 It verifies readiness gating, weight range/disconnect recovery, tare, saved grams,
 and A/B acceptance/retake behavior without accessing production data. Physical
 layout and the deployment's Bootstrap assets still require the touchscreen check above.
+
+
+### Camera Capture deployment commands (existing checkout)
+
+```bash
+cd /var/www/html/CGI-V2/pi_node
+# Stop the service before terminal camera tests; skip if not yet installed.
+sudo systemctl stop cgi-node
+mkdir -p camera-test
+CGI_HARDWARE_MODE=hardware venv/bin/python camera_capture.py camera-test/cgi-camera.jpg
+sudo cp cgi-node.service /etc/systemd/system/cgi-node.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now cgi-node
+sudo systemctl restart cgi-node
+curl --fail -H 'Content-Type: application/json' -d '{"view":"A","preview":true}' http://127.0.0.1:5000/capture > /tmp/cgi-live-preview.json
+```
+
+Keep dashboard Development Mode off for hardware use. The existing backend `.env`
+`PI_NODE_URL` must point at this Pi (`http://127.0.0.1:5000` if backend and Pi node
+run on the same machine). Restart the backend after deploying the hardware proxy
+change and reload the dashboard to load the updated JavaScript.

@@ -138,6 +138,12 @@
         let tareBusy = false;
         let weightReadAt = 0;
         let acceptedA = false, acceptedB = false;
+        let captureStage = false;
+        let captureBusy = false;
+        let stageGeneration = 0;
+        let previewGeneration = 0;
+        let cameraPreviewTimer = null;
+        let cameraPreviewRequest = null;
         let weightPollTimer  = null;   // setInterval handle for weight polling
         let analysisRunning  = false;  // guard against duplicate YOLOv8 requests
         
@@ -266,6 +272,9 @@
         
         // Clear all timers and state when modal is dismissed
         txnModalEl.addEventListener('hidden.bs.modal', () => {
+            captureStage = false;
+            stageGeneration++;
+            _stopCameraPreview();
             _stopWeightPoll();
             txnActive       = false;
             pendingId       = null;
@@ -298,6 +307,9 @@
         
         // ── Helpers ───────────────────────────────────────────────────────────────────
         function _setStage(n) {
+            stageGeneration++;
+            captureStage = n === 3;
+            _stopCameraPreview();
             document.querySelectorAll('.txn-stage').forEach(el => el.classList.add('d-none'));
             document.getElementById('stage-' + n).classList.remove('d-none');
             for (let i = 1; i <= 6; i++) {
@@ -306,6 +318,7 @@
                 else if (i === n) badge.className = 'step-badge active';
                 else              badge.className = 'step-badge';
             }
+            if (captureStage) _startCameraPreview();
         }
         
         function _showError(elId, msg) {
@@ -377,6 +390,8 @@
         // ── Stage 1 — Prepare ─────────────────────────────────────────────────────────
         
         async function _checkHardware() {
+            hwCamera = hwScale = 'checking';
+            _validateStage1();
             ['camera','scale','printer'].forEach(k => {
                 document.getElementById('hw-icon-' + k).textContent  = '⏳';
                 document.getElementById('hw-label-' + k).textContent = 'Checking…';
@@ -399,20 +414,20 @@
                 hwCamera  = data.camera;
                 hwScale   = data.scale;
                 hwPrinter = data.printer;
-                _updateHwCard('camera',  data.camera);
-                _updateHwCard('scale',   data.scale);
+                _updateHwCard('camera',  data.camera, data.details?.camera);
+                _updateHwCard('scale',   data.scale, data.details?.scale);
                 _updateHwCard('printer', data.printer);
             } catch (e) {
                 hwCamera = hwScale = 'error';
                 hwPrinter = 'warning';
-                _updateHwCard('camera',  'error');
-                _updateHwCard('scale',   'error');
+                _updateHwCard('camera',  'error', e.message);
+                _updateHwCard('scale',   'error', e.message);
                 _updateHwCard('printer', 'warning');
             }
             _validateStage1();
         }
         
-        function _updateHwCard(key, st) {
+        function _updateHwCard(key, st, detail = '') {
             const icons  = { ready: '✅', error: '❌', warning: '⚠️', checking: '⏳' };
             const labels = {
                 ready:   devMode && key !== 'printer' ? 'Ready (Simulated)' : 'Ready',
@@ -421,7 +436,9 @@
                 checking:'Checking…',
             };
             document.getElementById('hw-icon-' + key).textContent  = icons[st]  || '❓';
-            document.getElementById('hw-label-' + key).textContent = labels[st] || st;
+            const label = document.getElementById('hw-label-' + key);
+            label.textContent = st === 'error' && detail ? 'Error: ' + detail : (labels[st] || st);
+            label.title = detail || '';
         
             const overviewLabel = document.getElementById('overview-hw-' + key);
             const overviewCard = document.getElementById('overview-hw-card-' + key);
@@ -634,73 +651,165 @@
         
         // ── Stage 3 — Capture ─────────────────────────────────────────────────────────
         
+        function _stopCameraPreview() {
+            previewGeneration++;
+            clearTimeout(cameraPreviewTimer);
+            cameraPreviewTimer = null;
+            const image = document.getElementById('camera-live-preview');
+            image.classList.add('d-none');
+            image.removeAttribute('src');
+        }
+
+        function _startCameraPreview() {
+            if (!captureStage || captureBusy) return;
+            _stopCameraPreview();
+            const generation = previewGeneration;
+            const label = document.getElementById('camera-live-status');
+            label.textContent = 'Connecting to camera…';
+            const tick = async () => {
+                if (generation !== previewGeneration || !captureStage || captureBusy) return;
+                if (cameraPreviewRequest) {
+                    cameraPreviewTimer = setTimeout(tick, 300);
+                    return;
+                }
+                const image = document.getElementById('camera-live-preview');
+                cameraPreviewRequest = (async () => {
+                    try {
+                        let source, simulated = devMode;
+                        if (devMode) source = DEV._makePlaceholderImg('Live preview (Simulated)');
+                        else {
+                            const resp = await API.post('/api/hardware/capture', {
+                                view: acceptedA ? 'B' : 'A', preview: true
+                            });
+                            const data = await resp.json();
+                            if (!resp.ok || !data.image_b64) throw new Error(data.detail || 'Camera unavailable');
+                            source = 'data:image/jpeg;base64,' + data.image_b64;
+                            simulated = data.simulated === true;
+                        }
+                        if (generation !== previewGeneration) return;
+                        image.src = source;
+                        image.classList.remove('d-none');
+                        label.textContent = simulated ? 'Live preview — Simulated' : 'Live camera — Ready';
+                        hwCamera = 'ready';
+                        _updateHwCard('camera', 'ready');
+                    } catch (e) {
+                        if (generation !== previewGeneration) return;
+                        image.classList.add('d-none');
+                        image.removeAttribute('src');
+                        label.textContent = 'Camera unavailable — retrying…';
+                        hwCamera = 'error';
+                        _updateHwCard('camera', 'error');
+                    }
+                })();
+                await cameraPreviewRequest;
+                cameraPreviewRequest = null;
+                if (generation === previewGeneration && captureStage && !captureBusy)
+                    cameraPreviewTimer = setTimeout(tick, 500);
+            };
+            tick();
+        }
+
         async function _doCapture(view) {
-            const viewLower    = view.toLowerCase();
-            const btnCapture   = document.getElementById('btn-capture-' + viewLower);
-            const btnRetake    = document.getElementById('btn-retake-'  + viewLower);
-            const btnAccept    = document.getElementById('btn-accept-'  + viewLower);
-            const previewEl    = document.getElementById('view-' + viewLower + '-preview');
-            const countEl      = document.getElementById('view-' + viewLower + '-count');
-            const countdownDiv = document.getElementById('view-' + viewLower + '-countdown');
-            const badgeEl      = document.getElementById('view-' + viewLower + '-badge');
-        
-            btnCapture.disabled = true;
-            btnRetake.classList.add('d-none');
-            btnAccept.classList.add('d-none');
-            previewEl.classList.add('d-none');
-            _hideError('stage3-error');
-        
-            // 3-second countdown — identical in both modes
-            countdownDiv.classList.remove('d-none');
-            for (let i = 3; i >= 1; i--) {
-                countEl.textContent = i;
-                await new Promise(r => setTimeout(r, 1000));
-            }
-            countEl.textContent = '📷';
-            await new Promise(r => setTimeout(r, 400));
-            countdownDiv.classList.add('d-none');
-        
-            let imgSrc;
-        
-            if (devMode) {
-                // Use a placeholder SVG image — no Pi camera call
-                imgSrc = DEV._makePlaceholderImg('View ' + view);
-                // Store as dataURI string; the backend call in Analyze will also be mocked
-                if (view === 'A') imageAb64 = imgSrc;
-                else              imageBb64 = imgSrc;
-            } else {
-                // Production: trigger Pi camera
-                try {
-                    const resp = await API.post('/api/hardware/capture', { view });
-                    if (!resp.ok) {
-                        const err = await resp.json();
-                        _showError('stage3-error', 'Capture failed: ' + (err.detail || 'Unknown error'));
+            if (!captureStage || captureBusy || (view === 'B' && !acceptedA)) return;
+            captureBusy = true;
+            const generation = stageGeneration;
+            _stopCameraPreview();
+            document.getElementById('camera-live-status').textContent = 'Capturing…';
+            try {
+                // Finish the outstanding preview before requesting the still.
+                if (cameraPreviewRequest) await cameraPreviewRequest;
+                if (generation !== stageGeneration) return;
+                const viewLower    = view.toLowerCase();
+                const btnCapture   = document.getElementById('btn-capture-' + viewLower);
+                const btnRetake    = document.getElementById('btn-retake-'  + viewLower);
+                const btnAccept    = document.getElementById('btn-accept-'  + viewLower);
+                const previewEl    = document.getElementById('view-' + viewLower + '-preview');
+                const countEl      = document.getElementById('view-' + viewLower + '-count');
+                const countdownDiv = document.getElementById('view-' + viewLower + '-countdown');
+                const badgeEl      = document.getElementById('view-' + viewLower + '-badge');
+
+                btnCapture.disabled = true;
+                btnRetake.classList.add('d-none');
+                btnAccept.classList.add('d-none');
+                previewEl.classList.add('d-none');
+                _hideError('stage3-error');
+
+                // 3-second countdown — identical in both modes
+                countdownDiv.classList.remove('d-none');
+                for (let i = 3; i >= 1; i--) {
+                    countEl.textContent = i;
+                    await new Promise(r => setTimeout(r, 1000));
+                    if (generation !== stageGeneration) return;
+                }
+                countEl.textContent = '📷';
+                await new Promise(r => setTimeout(r, 400));
+                if (generation !== stageGeneration) return;
+                countdownDiv.classList.add('d-none');
+
+                let imgSrc;
+
+                if (devMode) {
+                    // Use a placeholder SVG image — no Pi camera call
+                    imgSrc = DEV._makePlaceholderImg('View ' + view);
+                    // Store as dataURI string; the backend call in Analyze will also be mocked
+                    if (view === 'A') imageAb64 = imgSrc;
+                    else              imageBb64 = imgSrc;
+                } else {
+                    // Production: trigger Pi camera
+                    try {
+                        const resp = await API.post('/api/hardware/capture', { view });
+                        if (generation !== stageGeneration) return;
+                        if (!resp.ok) {
+                            const err = await resp.json();
+                            hwCamera = 'error';
+                            _updateHwCard('camera', 'error');
+                            _showError('stage3-error', 'Capture failed: ' + (err.detail || 'Unknown error'));
+                            btnCapture.disabled = false;
+                            return;
+                        }
+                        const data = await resp.json();
+                        if (generation !== stageGeneration) return;
+                        if (!data.image_b64 || data.preview === true) throw new Error('No captured image returned');
+                        hwCamera = 'ready';
+                        _updateHwCard('camera', 'ready');
+                        imgSrc = 'data:image/jpeg;base64,' + data.image_b64;
+                        if (view === 'A') imageAb64 = data.image_b64;
+                        else              imageBb64 = data.image_b64;
+                    } catch (e) {
+                        if (generation !== stageGeneration) return;
+                        hwCamera = 'error';
+                        _updateHwCard('camera', 'error');
+                        _showError('stage3-error', 'Capture failed: ' + e.message);
                         btnCapture.disabled = false;
                         return;
                     }
-                    const data = await resp.json();
-                    imgSrc = 'data:image/jpeg;base64,' + data.image_b64;
-                    if (view === 'A') imageAb64 = data.image_b64;
-                    else              imageBb64 = data.image_b64;
-                } catch (e) {
-                    _showError('stage3-error', 'Network error: ' + e.message);
-                    btnCapture.disabled = false;
-                    return;
                 }
+
+                previewEl.src = imgSrc;
+                previewEl.classList.remove('d-none');
+                btnRetake.classList.remove('d-none');
+                btnAccept.classList.remove('d-none');
+                badgeEl.textContent = devMode ? 'Preview (Simulated) — Accept or Retake' : 'Preview — Accept or Retake';
+                badgeEl.className   = 'badge bg-warning text-dark';
+            } finally {
+                captureBusy = false;
+                if (generation === stageGeneration) {
+                    document.getElementById('view-' + view.toLowerCase() + '-countdown').classList.add('d-none');
+                }
+                if (captureStage) _startCameraPreview();
             }
-        
-            previewEl.src = imgSrc;
-            previewEl.classList.remove('d-none');
-            btnRetake.classList.remove('d-none');
-            btnAccept.classList.remove('d-none');
-            badgeEl.textContent = devMode ? 'Preview (Simulated) — Accept or Retake' : 'Preview — Accept or Retake';
-            badgeEl.className   = 'badge bg-warning text-dark';
         }
         
         document.getElementById('btn-capture-a').addEventListener('click', () => _doCapture('A'));
         document.getElementById('btn-capture-b').addEventListener('click', () => _doCapture('B'));
         
-        function _retakeView(view) {
+        function _retakeView(view, force = false) {
+            if (captureBusy && !force) return;
+            if (view === 'A') {
+                _retakeView('B', force);
+                document.getElementById('btn-capture-b').disabled = true;
+                document.getElementById('reorient-instruction').classList.add('d-none');
+            }
             const vl = view.toLowerCase();
             document.getElementById('view-' + vl + '-preview').classList.add('d-none');
             document.getElementById('btn-retake-' + vl).classList.add('d-none');
@@ -715,6 +824,7 @@
         }
         
         function _acceptView(view) {
+            if (captureBusy || (view === 'A' ? !imageAb64 : !imageBb64 || !acceptedA)) return;
             const vl      = view.toLowerCase();
             const badgeEl = document.getElementById('view-' + vl + '-badge');
             badgeEl.textContent = '✓ Accepted';
@@ -740,8 +850,11 @@
         document.getElementById('btn-accept-b').addEventListener('click', () => _acceptView('B'));
         
         document.getElementById('btn-back-to-weight').addEventListener('click', () => {
-            _retakeView('A');
-            _retakeView('B');
+            imageAb64 = imageBb64 = null;
+            acceptedA = acceptedB = false;
+            document.getElementById('btn-to-analyze').disabled = true;
+            _retakeView('A', true);
+            _retakeView('B', true);
             document.getElementById('btn-capture-b').disabled = true;
             document.getElementById('reorient-instruction').classList.add('d-none');
             _setStage(2);
@@ -749,6 +862,7 @@
         });
         
         document.getElementById('btn-to-analyze').addEventListener('click', () => {
+            if (captureBusy || !acceptedA || !acceptedB || !imageAb64 || !imageBb64) return;
             document.getElementById('analyze-view-a').src = devMode ? imageAb64 : ('data:image/jpeg;base64,' + imageAb64);
             document.getElementById('analyze-view-b').src = devMode ? imageBb64 : ('data:image/jpeg;base64,' + imageBb64);
             _setStage(4);

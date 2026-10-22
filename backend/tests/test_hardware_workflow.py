@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import types
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -49,6 +50,8 @@ def test_hardware_mode_never_silently_simulates(monkeypatch):
     with pytest.raises(RuntimeError, match='Disconnected'):
         pi_server._read_weight()
     assert pi_server._last_weight is None
+    monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(side_effect=RuntimeError('Disconnected')))
+    pi_server._camera_checked_at = 0
     assert pi_server._camera_readiness() == 'error'
 
 
@@ -64,6 +67,8 @@ def test_worker_deadline_reaps_stuck_driver():
 def pi_http(monkeypatch):
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'simulation')
     pi_server._last_weight = None
+    worker = hardware_runtime.CameraWorker()
+    monkeypatch.setattr(pi_server, '_camera_worker', worker)
     server = pi_server.ThreadingHTTPServer(('127.0.0.1', 0), pi_server.PiRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -74,6 +79,7 @@ def pi_http(monkeypatch):
     server.shutdown()
     server.server_close()
     thread.join()
+    worker.close()
 
 
 def test_hardware_to_saved_dual_transaction(client, officer_token, farmer_id, pi_http, monkeypatch, tmp_path):
@@ -83,7 +89,7 @@ def test_hardware_to_saved_dual_transaction(client, officer_token, farmer_id, pi
     monkeypatch.setattr(inspection.settings, 'UPLOAD_DIR', str(tmp_path))
     headers = _auth_header(officer_token)
     status = client.get('/api/hardware/status', headers=headers).json()
-    assert status == {'camera': 'ready', 'scale': 'ready', 'printer': 'warning', 'simulated': True}
+    assert status == {'camera': 'ready', 'scale': 'ready', 'printer': 'warning', 'simulated': True, 'details': {}}
     assert client.post('/api/hardware/weight', headers=headers, json={'action': 'tare'}).json()['tared']
     first = client.get('/api/hardware/weight', headers=headers).json()
     second = client.get('/api/hardware/weight', headers=headers).json()
@@ -117,6 +123,7 @@ def test_hardware_to_saved_dual_transaction(client, officer_token, farmer_id, pi
     assert analyzed.status_code == 201, analyzed.text
     result = analyzed.json()
     assert len(seen) == 2
+    assert [base64.b64encode(Path(path).read_bytes()).decode() for path in seen] == images
     assert result['sample_weight_g'] == 350 and result['txn_number'] == init.json()['txn_number']
     with _TestSession() as db:
         txn = db.get(Transaction, result['txn_id'])
@@ -129,9 +136,12 @@ def test_disconnections_and_recovery(client, officer_token, pi_http, monkeypatch
     headers = _auth_header(officer_token)
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
     monkeypatch.setattr(pi_server, 'run_hardware', Mock(side_effect=TimeoutError('Device disconnected')))
+    monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(side_effect=TimeoutError('Camera disconnected')))
     pi_server._camera_checked_at = 0
     status = client.get('/api/hardware/status', headers=headers).json()
     assert status['camera'] == status['scale'] == 'error'
+    assert status['details']['camera'] == 'Camera disconnected'
+    assert status['details']['scale'] == 'Device disconnected'
     assert client.get('/api/hardware/weight', headers=headers).status_code == 503
     assert client.post('/api/hardware/capture', headers=headers, json={'view': 'A'}).status_code == 502
     assert client.post('/api/hardware/weight', headers=headers, json={'action': 'tare'}).status_code == 503
@@ -160,6 +170,12 @@ def test_picamera_autofocus_capture_and_cleanup(monkeypatch):
     import camera_capture
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
     monkeypatch.setattr(camera_capture, '_ON_PI', True)
+    cfg = config()
+    cfg.add_section('camera')
+    cfg.set('camera', 'FOCUS_MODE', 'auto')
+    monkeypatch.setattr(camera_capture, '_load_config', lambda: cfg)
+    monkeypatch.setitem(sys.modules, 'libcamera', types.SimpleNamespace(controls=types.SimpleNamespace(
+        AfModeEnum=types.SimpleNamespace(Manual=0, Auto=1, Continuous=2))))
     cam = Mock()
     cam.autofocus_cycle.return_value = True
     cam.capture_file.side_effect = lambda stream, **kwargs: stream.write(b'jpeg-test')
@@ -173,3 +189,99 @@ def test_picamera_autofocus_capture_and_cleanup(monkeypatch):
     with pytest.raises(RuntimeError, match='autofocus'):
         camera_capture.capture_image()
     cam.close.assert_called_once()
+
+
+def test_preview_reuses_capture_worker_and_does_not_save(client, officer_token, pi_http):
+    headers = _auth_header(officer_token)
+    from models.inspection import Inspection
+    with _TestSession() as db:
+        before = db.query(Inspection).count()
+    preview = client.post('/api/hardware/capture', headers=headers,
+                          json={'view': 'A', 'preview': True})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()['preview'] is True and preview.json()['simulated'] is True
+    image = Image.open(io.BytesIO(base64.b64decode(preview.json()['image_b64'])))
+    assert image.width <= 640 and image.height <= 360
+    pid = pi_server._camera_worker.process.pid
+    still = client.post('/api/hardware/capture', headers=headers, json={'view': 'B'})
+    assert still.status_code == 200, still.text
+    assert still.json()['preview'] is False
+    assert pi_server._camera_worker.process.pid == pid
+    full = Image.open(io.BytesIO(base64.b64decode(still.json()['image_b64'])))
+    assert full.width > image.width
+    with _TestSession() as db:
+        assert db.query(Inspection).count() == before
+    assert client.post('/api/hardware/capture', json={'view': 'A', 'preview': True}).status_code in (401, 403)
+
+
+def test_camera_worker_deadline_and_restart(monkeypatch):
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'simulation')
+    worker = hardware_runtime.CameraWorker()
+    try:
+        with pytest.raises(TimeoutError):
+            worker.request('preview', timeout=0)
+        assert worker.process is None and worker.conn is None
+        assert worker.request('preview').startswith(b'\xff\xd8')
+        assert worker.request('capture').startswith(b'\xff\xd8')
+    finally:
+        worker.close()
+
+
+def test_manual_picamera_configuration_matches_working_terminal(monkeypatch):
+    import camera_capture
+    cfg = config()
+    cfg.add_section('camera')
+    cfg.set('camera', 'FOCUS_MODE', 'manual')
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(camera_capture, '_ON_PI', True)
+    monkeypatch.setitem(sys.modules, 'libcamera', types.SimpleNamespace(controls=types.SimpleNamespace(
+        AfModeEnum=types.SimpleNamespace(Manual=0, Auto=1, Continuous=2))))
+    cam = Mock()
+    image = io.BytesIO()
+    Image.new('RGB', (1920, 1080)).save(image, format='JPEG')
+    cam.capture_file.side_effect = lambda stream, **kwargs: stream.write(image.getvalue())
+    monkeypatch.setattr(camera_capture, 'Picamera2', Mock(return_value=cam), raising=False)
+    monkeypatch.setattr(camera_capture.time, 'sleep', lambda _: None)
+    session = camera_capture.CameraSession(cfg)
+    try:
+        assert session.frame().startswith(b'\xff\xd8')
+        small = Image.open(io.BytesIO(session.frame(preview=True)))
+        assert small.size == (640, 360)
+        cam.autofocus_cycle.assert_not_called()
+        kwargs = cam.create_still_configuration.call_args.kwargs
+        assert kwargs['controls'] == {'AfMode': 0}
+        assert kwargs['queue'] is False
+    finally:
+        session.close()
+    cam.close.assert_called_once()
+
+
+def test_readiness_reports_transport_and_outdated_service_errors(client, officer_token):
+    import httpx
+    headers = _auth_header(officer_token)
+    for failure, expected in [(httpx.ConnectError('refused'), 'Cannot reach Pi service'),
+                              (httpx.ReadTimeout('timeout'), 'timed out')]:
+        with patch('routers.hardware._pi_get', new=AsyncMock(side_effect=failure)), patch(
+            'routers.hardware._check_printer', new=AsyncMock(return_value='warning')):
+            response = client.get('/api/hardware/status', headers=headers)
+        assert response.status_code == 200
+        assert response.json()['camera'] == 'error'
+        assert expected in response.json()['details']['camera']
+    with patch('routers.hardware._pi_get', new=AsyncMock(return_value={'weight_g':350})), patch(
+        'routers.hardware._check_printer', new=AsyncMock(return_value='warning')):
+        response = client.get('/api/hardware/status', headers=headers)
+    assert response.json()['camera'] == 'error'
+    assert 'outdated' in response.json()['details']['camera']
+
+
+def test_camera_readiness_is_independent_of_failed_scale(client, officer_token, pi_http, monkeypatch):
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server, 'run_hardware', Mock(side_effect=RuntimeError('HX711 disconnected')))
+    monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(return_value=b'jpeg'))
+    pi_server._camera_checked_at = 0
+    response = client.get('/api/hardware/status', headers=_auth_header(officer_token))
+    assert response.status_code == 200
+    assert response.json()['camera'] == 'ready'
+    assert response.json()['scale'] == 'error'
+    assert 'camera' not in response.json()['details']
+    assert response.json()['details']['scale'] == 'HX711 disconnected'

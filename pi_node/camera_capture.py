@@ -1,14 +1,8 @@
-"""
-camera_capture.py — Pi Camera Module 3 image capture using picamera2.
-
-Captures a single still image and returns the JPEG bytes or saves to a file.
-Uses a simulated JPEG only when the explicit hardware mode policy permits it.
-"""
-
+"""Shared Picamera2 configuration for CLI capture and the existing Pi HTTP server."""
+import configparser
 import io
 import os
 import time
-import configparser
 from typing import Optional
 
 try:
@@ -18,93 +12,100 @@ except (ImportError, RuntimeError):
     _ON_PI = False
 
 
-def _load_config() -> configparser.ConfigParser:
+def _load_config():
     cfg = configparser.ConfigParser()
-    config_path = os.path.join(os.path.dirname(__file__), "config.ini")
-    if os.path.exists(config_path):
-        cfg.read(config_path)
+    cfg.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
     return cfg
 
 
-def capture_image(save_path: Optional[str] = None) -> bytes:
-    """
-    Capture a still image from the Pi Camera Module 3.
+class CameraSession:
+    """One configured camera supplies fresh preview frames and full-size stills."""
+    def __init__(self, cfg=None):
+        self.cfg = cfg if cfg is not None else _load_config()
+        self.cam = None
+        from hardware_runtime import simulated
+        self.simulated = simulated(self.cfg)
+        self.focus = self.cfg.get('camera', 'FOCUS_MODE', fallback='manual').lower()
+        if self.focus not in ('manual', 'auto', 'continuous'):
+            raise ValueError('camera.FOCUS_MODE must be manual, auto, or continuous')
+        if self.simulated:
+            return
+        if not _ON_PI:
+            raise RuntimeError('Picamera2 unavailable; install Raspberry Pi OS camera packages')
+        from libcamera import controls
+        self.cam = Picamera2()
+        try:
+            modes = {'manual': controls.AfModeEnum.Manual, 'auto': controls.AfModeEnum.Auto,
+                     'continuous': controls.AfModeEnum.Continuous}
+            camera_controls = {'AfMode': modes[self.focus]}
+            # Leave the lens at its initial position unless explicitly configured,
+            # matching the successful terminal --autofocus-mode manual test.
+            lens = self.cfg.get('camera', 'LENS_POSITION', fallback='').strip()
+            if self.focus == 'manual' and lens:
+                camera_controls['LensPosition'] = float(lens)
+            self.cam.configure(self.cam.create_still_configuration(
+                main={'size': (self.cfg.getint('camera', 'RESOLUTION_WIDTH', fallback=1920),
+                               self.cfg.getint('camera', 'RESOLUTION_HEIGHT', fallback=1080)),
+                      'format': 'BGR888'}, controls=camera_controls, buffer_count=3, queue=False))
+            self.cam.start()
+            time.sleep(self.cfg.getfloat('camera', 'AUTOFOCUS_WAIT', fallback=1.5))
+        except Exception:
+            self.close()
+            raise
 
-    Args:
-        save_path: If provided, also saves the image to this file path.
-
-    Returns:
-        Raw JPEG bytes of the captured image.
-    """
-    cfg = _load_config()
-
-    from hardware_runtime import simulated
-    if simulated(cfg):
-        # Development image — never used to mask hardware failures
+    def frame(self, preview=False):
         from PIL import Image
-        img = Image.new("RGB", (1280, 960), color=(240, 230, 210))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90)
-        data = buf.getvalue()
-        if save_path:
-            with open(save_path, "wb") as f:
-                f.write(data)
-        return data
+        if self.simulated:
+            image = Image.new('RGB', (1280, 960), color=(240, 230, 210))
+            if preview:
+                image.thumbnail((640, 360))
+            image.save(buf, format='JPEG', quality=75 if preview else 90)
+        else:
+            if not preview and self.focus == 'auto' and not self.cam.autofocus_cycle():
+                raise RuntimeError('Camera autofocus failed; check lighting and sample distance')
+            self.cam.capture_file(buf, format='jpeg')
+            if preview:
+                buf.seek(0)
+                with Image.open(buf) as image:
+                    image.thumbnail((640, 360))
+                    small = io.BytesIO()
+                    image.save(small, format='JPEG', quality=70)
+                return small.getvalue()
+        return buf.getvalue()
 
-    if not _ON_PI:
-        raise RuntimeError('Picamera2 unavailable; install the Raspberry Pi OS camera packages')
+    def close(self):
+        if self.cam is not None:
+            self.cam.close()
+            self.cam = None
 
-    width  = cfg.getint("camera", "RESOLUTION_WIDTH",  fallback=1920)
-    height = cfg.getint("camera", "RESOLUTION_HEIGHT", fallback=1080)
-    af_wait = cfg.getfloat("camera", "AUTOFOCUS_WAIT", fallback=1.5)
 
-    cam = Picamera2()
+def capture_image(save_path: Optional[str] = None) -> bytes:
+    session = CameraSession()
     try:
-        still_config = cam.create_still_configuration(
-            main={"size": (width, height), "format": "BGR888"}
-        )
-        cam.configure(still_config)
-        cam.start()
-
-        # Allow autofocus to settle
-        time.sleep(af_wait)
-        if not cam.autofocus_cycle():
-            raise RuntimeError('Camera autofocus failed; check lighting and sample distance')
-
-        buf = io.BytesIO()
-        cam.capture_file(buf, format="jpeg")
-        data = buf.getvalue()
-
+        data = session.frame()
         if save_path:
-            with open(save_path, "wb") as f:
-                f.write(data)
-
+            with open(save_path, 'wb') as stream:
+                stream.write(data)
         return data
     finally:
-        cam.close()
+        session.close()
 
 
 def camera_ready():
-    if not _ON_PI:
-        raise RuntimeError('Picamera2 driver unavailable')
-    cam = Picamera2()
+    session = CameraSession()
     try:
-        cam.configure(cam.create_still_configuration())
-        cam.start()
-        cam.capture_metadata()
+        session.frame(preview=True)  # Readiness means actual frames, not just enumeration.
         return True
     finally:
-        cam.close()
+        session.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     import sys
-    out = sys.argv[1] if len(sys.argv) > 1 else "test_capture.jpg"
-    from hardware_runtime import simulated, run_hardware
-    if simulated(_load_config()):
-        img_bytes = capture_image(save_path=out)
-    else:
-        img_bytes = run_hardware('capture', timeout=20)
-        with open(out, 'wb') as stream:
-            stream.write(img_bytes)
-    print(f"Captured {len(img_bytes):,} bytes → {out}")
+    from hardware_runtime import run_hardware
+    out = sys.argv[1] if len(sys.argv) > 1 else 'test_capture.jpg'
+    data = run_hardware('capture', timeout=20)
+    with open(out, 'wb') as stream:
+        stream.write(data)
+    print(f'Captured {len(data):,} bytes → {out}')

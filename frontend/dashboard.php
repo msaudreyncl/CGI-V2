@@ -369,6 +369,11 @@ if ($role !== 'farmer') {
         <div id="stage-3" class="txn-stage d-none">
           <h6 class="fw-bold text-success mb-3">Stage 3 — Capture</h6>
 
+          <div class="card border mb-3 p-3">
+            <div id="camera-live-status" class="small text-muted mb-2" role="status" aria-live="polite">Connecting to camera…</div>
+            <img id="camera-live-preview" class="capture-preview d-none" style="max-height:180px;object-fit:contain" alt="Live camera preview">
+          </div>
+
           <!-- View A -->
           <div class="card border mb-3 p-3" id="view-a-section">
             <div class="d-flex justify-content-between align-items-center mb-2">

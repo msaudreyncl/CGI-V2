@@ -1,7 +1,7 @@
 """routers/hardware.py — Hardware status, weight poll, and camera capture proxy.
 
 Acts as a single-origin proxy so the browser only communicates with the
-FastAPI backend (port 8000).  All three endpoints forward calls to the Pi
+FastAPI backend (port 8000).  Hardware requests forward calls to the Pi
 node HTTP server (pi_server.py, default port 5000).
 
 Hardware gate rules (per spec §1.3 confirmed design):
@@ -27,7 +27,7 @@ settings = get_settings()
 
 async def _pi_get(path: str) -> dict:
     """GET {PI_NODE_URL}{path} and return parsed JSON, or raise on failure."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(settings.PI_NODE_URL.rstrip("/") + path)
         # /weight reports independent readiness even when the scale failed.
         if path == "/weight" and resp.status_code == 503:
@@ -87,12 +87,29 @@ async def hardware_status(
         printer: "ready" | "warning"   (printer failure is non-blocking)
     """
     data = {}
+    details = {}
     try:
         data = await _pi_get("/weight")
         camera_status = data.get("camera", "error")
         scale_status = data.get("scale", "error")
-    except Exception:
+        if "camera" not in data:
+            details["camera"] = "Pi service is outdated: restart the updated pi_server.py."
+        elif camera_status == "error":
+            details["camera"] = data.get("camera_error") or "Pi camera could not return a frame. Check the Pi service log."
+        if scale_status == "error":
+            details["scale"] = data.get("error") or "Scale is unavailable."
+    except httpx.ConnectError:
         camera_status = scale_status = "error"
+        reason = f"Cannot reach Pi service at {settings.PI_NODE_URL}. Start cgi-node and check PI_NODE_URL."
+        details = {"camera": reason, "scale": reason}
+    except httpx.TimeoutException:
+        camera_status = scale_status = "error"
+        reason = "Pi readiness request timed out. Check the Pi service log."
+        details = {"camera": reason, "scale": reason}
+    except Exception as exc:
+        camera_status = scale_status = "error"
+        reason = f"Pi readiness check failed: {exc}"
+        details = {"camera": reason, "scale": reason}
 
     printer_status = await _check_printer()
 
@@ -101,6 +118,7 @@ async def hardware_status(
         "scale":   scale_status,
         "printer": printer_status,
         "simulated": data.get("simulated", False),
+        "details": details,
     }
 
 
@@ -137,6 +155,7 @@ async def get_weight(
 
 class HardwareCaptureRequest(BaseModel):
     view: str  # "A" or "B"
+    preview: bool = False  # small live frame; never saved as an accepted view
 
 
 @router.post("/capture")
@@ -149,6 +168,7 @@ async def trigger_capture(
 
     Request body:
         view — "A" or "B"
+        preview — optional; True returns a small live JPEG without accepting a view
 
     Returns:
         image_b64 — base64-encoded JPEG bytes
@@ -159,7 +179,7 @@ async def trigger_capture(
         raise HTTPException(status_code=400, detail="view must be 'A' or 'B'")
 
     try:
-        return await _pi_post("/capture", {"view": view})
+        return await _pi_post("/capture", {"view": view, "preview": body.preview})
     except httpx.ConnectError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

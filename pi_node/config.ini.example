@@ -16,7 +16,12 @@ RESOLUTION_WIDTH  = 1920
 RESOLUTION_HEIGHT = 1080
 # Still image format
 IMAGE_FORMAT = jpeg
-# Autofocus wait time in seconds
+# manual matches the confirmed terminal capture; auto runs a cycle for each still.
+# continuous keeps focusing during live preview. Verify focus on the mounted tray.
+FOCUS_MODE = manual
+# Optional manual position in dioptres; blank preserves the initial position.
+LENS_POSITION =
+# Exposure/focus settling time in seconds
 AUTOFOCUS_WAIT = 1.5
 
 [load_cell]

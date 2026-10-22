@@ -10,8 +10,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from camera_capture import capture_image
-from hardware_runtime import run_hardware, simulated
+from hardware_runtime import CameraWorker, run_hardware, simulated
 from hx711_reader import _load_config, save_scale_config
 
 _scale_lock = threading.Lock()
@@ -20,6 +19,8 @@ _last_weight = None
 _last_read_at = 0
 _camera_checked_at = 0
 _camera_status = 'error'
+_camera_error = None
+_camera_worker = CameraWorker()
 
 
 def _read_weight():
@@ -41,31 +42,37 @@ def _read_weight():
 
 
 def _camera_readiness():
-    global _camera_checked_at, _camera_status
+    global _camera_checked_at, _camera_status, _camera_error
     if simulated(_load_config()):
+        _camera_error = None
         return 'ready'
     # Do not contend with an active capture; a fresh capture is also a probe.
     with _camera_lock:
         if time.monotonic() - _camera_checked_at > 2:
             try:
-                run_hardware('camera', timeout=3)
+                _camera_worker.request('preview', timeout=8)
                 _camera_status = 'ready'
-            except Exception:
+                _camera_error = None
+            except Exception as exc:
                 _camera_status = 'error'
+                _camera_error = str(exc)
+                print(f'[camera readiness] {_camera_error}', flush=True)
             _camera_checked_at = time.monotonic()
         return _camera_status
 
 
-def _capture_image_b64():
-    global _camera_status, _camera_checked_at
+def _capture_image_b64(preview=False):
+    global _camera_status, _camera_checked_at, _camera_error
     if not _camera_lock.acquire(blocking=False):
         raise RuntimeError('Camera is busy; retry after the current capture')
     try:
-        data = capture_image() if simulated(_load_config()) else run_hardware('capture', timeout=20)
+        data = _camera_worker.request('preview' if preview else 'capture', timeout=20)
         _camera_status = 'ready'
+        _camera_error = None
         return base64.b64encode(data).decode('ascii')
-    except Exception:
+    except Exception as exc:
         _camera_status = 'error'
+        _camera_error = str(exc)
         raise
     finally:
         _camera_checked_at = time.monotonic()
@@ -99,8 +106,8 @@ class PiRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path != '/weight':
             return self._send_json(404, {'error': 'Not found'})
-        payload = {'camera': _camera_readiness(), 'scale': 'error',
-                   'simulated': simulated(_load_config())}
+        payload = {'camera': _camera_readiness(), 'camera_error': _camera_error,
+                   'scale': 'error', 'simulated': simulated(_load_config())}
         try:
             weight, stable, in_range = _read_weight()
             payload.update(weight_g=round(weight, 2), stable=stable,
@@ -124,6 +131,8 @@ class PiRequestHandler(BaseHTTPRequestHandler):
             if self.path == '/weight':
                 if body.get('action') != 'tare':
                     raise ValueError('action must be tare')
+            elif not isinstance(body.get('preview', False), bool):
+                raise ValueError('preview must be a boolean')
             elif body.get('view') not in ('A', 'B'):
                 raise ValueError("view must be 'A' or 'B'")
         except (ValueError, TimeoutError) as exc:
@@ -132,7 +141,8 @@ class PiRequestHandler(BaseHTTPRequestHandler):
             if self.path == '/weight':
                 payload = _tare()
             else:
-                payload = {'image_b64': _capture_image_b64(), 'view': body['view'],
+                payload = {'image_b64': _capture_image_b64(preview=body.get('preview', False)), 'view': body['view'],
+                           'preview': body.get('preview', False),
                            'simulated': simulated(_load_config())}
             self._send_json(200, payload)
         except Exception as exc:
@@ -151,6 +161,7 @@ def main():
         pass
     finally:
         server.server_close()
+        _camera_worker.close()
 
 
 if __name__ == '__main__':

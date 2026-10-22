@@ -63,3 +63,77 @@ def run_hardware(operation, timeout=4.0):
             process.kill()
             process.join()
         parent.close()
+
+
+def _camera_worker(conn):
+    """Own libcamera in one child; exit when idle so terminal tools can reuse it."""
+    session = None
+    try:
+        from camera_capture import CameraSession
+        session = CameraSession()
+        while conn.poll(15):
+            operation = conn.recv()
+            data = session.frame(preview=operation != 'capture')
+            conn.send((True, data))
+    except (EOFError, BrokenPipeError):
+        pass
+    except Exception as exc:
+        try:
+            conn.send((False, str(exc)))
+        except (BrokenPipeError, EOFError):
+            pass
+    finally:
+        if session is not None:
+            session.close()
+        conn.close()
+
+
+class CameraWorker:
+    """Serialized by pi_server's camera lock. Failed workers are reaped on retry."""
+    def __init__(self):
+        self.process = None
+        self.conn = None
+        self.config = None
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+        if self.process is not None:
+            if self.process.is_alive():
+                self.process.terminate()
+            self.process.join(timeout=1)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join()
+            self.process = None
+
+    def request(self, operation, timeout=20):
+        from camera_capture import _load_config
+        cfg = _load_config()
+        fingerprint = (dict(cfg.items('camera')) if cfg.has_section('camera') else {}, simulated(cfg))
+        if self.process is None or not self.process.is_alive() or self.config != fingerprint:
+            self.close()
+            ctx = multiprocessing.get_context('spawn')
+            self.conn, child = ctx.Pipe()
+            self.process = ctx.Process(target=_camera_worker, args=(child,), daemon=True)
+            self.process.start()
+            child.close()
+            self.config = fingerprint
+        try:
+            self.conn.send(operation)
+            if not self.conn.poll(timeout):
+                raise TimeoutError('Camera timed out; check camera connection')
+            ok, result = self.conn.recv()
+            if not ok:
+                raise RuntimeError(result)
+            return result
+        except TimeoutError:
+            self.close()
+            raise
+        except (EOFError, BrokenPipeError, OSError) as exc:
+            self.close()
+            raise RuntimeError('Camera disconnected; retry capture') from exc
+        except Exception:
+            self.close()
+            raise
