@@ -351,6 +351,8 @@ if ($role !== 'farmer') {
           <div class="text-center my-4">
             <div id="live-weight-value" class="text-secondary">— g</div>
             <div id="weight-status-badge" class="mt-2"></div>
+            <button type="button" id="btn-tare-scale" class="btn btn-outline-secondary btn-lg mt-3">Tare empty scale</button>
+            <div class="small text-muted mt-2">Remove the beans and leave the empty tray before taring.</div>
           </div>
 
           <div id="stage2-error" class="d-none" aria-hidden="true"></div>

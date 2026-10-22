@@ -1,158 +1,200 @@
-# Pi Node — Dependency Installation Guide
+# Camera Module 3 + HX711 integration
 
-**Target OS:** Raspberry Pi OS Bookworm 64-bit (Debian 12)  
-**Hardware:** Raspberry Pi 4 or 5, Pi Camera Module 3, HX711 load cell amplifier
+## Existing architecture and API audit
 
-Use the OS-provided Python 3.11 for this environment. Do not create this venv
-with a separately installed Python 3.13: apt-installed Picamera2/libcamera modules
-are built for the OS Python ABI and may not be importable from it.
+The touchscreen uses `frontend/assets/js/dashboard.js` through the existing
+JWT-authenticated FastAPI hardware proxy. The Pi runs **pi_server.py**:
 
----
-
-## Why a two-phase install is required
-
-| Package | Source | Reason |
+| Browser/backend API | Pi operation | Purpose |
 |---|---|---|
-| `picamera2` | `apt` only | Not on PyPI. Requires libcamera C-extensions tied to OS ABI. |
-| `python3-libcamera` | `apt` only | C-extension dependency of picamera2; not available from pip. |
-| `RPi.GPIO` | `apt` preferred | System package is pre-patched for the running Bookworm kernel. |
-| `hx711==1.1.2.3` | `pip` | Pure-Python; safe to install from PyPI. |
-| `requests==2.31.0` | `pip` | Pure-Python; safe to install from PyPI. |
+| GET `/api/hardware/status` | GET `/weight` | Independent camera/scale readiness; printer stays non-blocking |
+| GET `/api/hardware/weight` | GET `/weight` | Grams, consecutive-reading stability (≤0.5 g), 340–360 g range |
+| POST `/api/hardware/weight` `{ "action": "tare" }` | POST `/weight`, same body | Zero the empty tray, save offset |
+| POST `/api/hardware/capture` `{ "view": "A" }` (or B) | POST `/capture` | Picamera2 autofocus + JPEG |
+| POST `/api/transaction/init` | Existing backend workflow | Creates pending transaction |
+| PUT `/api/transaction/{id}/weight` | Existing backend workflow | Validates and saves grams |
+| POST `/api/inspection/capture-dual` | Existing YOLO service | Analyzes A/B, saves images and inspection/transaction |
 
-A standard `python -m venv venv` is fully isolated and cannot see apt-installed
-packages. The `--system-site-packages` flag makes the venv inherit the system Python
-site-packages, bridging both sources cleanly.
+No new URL paths or database structures are needed. Tare adds a POST operation
+to the existing weight resource. Weight is carried from `pending_transactions.weight_g`
+to `inspections.sample_weight_g` and `transactions.weight_kg`. Both accepted views
+are sent together to the existing dual analysis endpoint; retakes remain available.
 
----
+The old `sensor_node.py` is a legacy single-image push utility, not the touchscreen
+transaction service. Do not run it beside pi_server.py: both would own the GPIO/camera,
+and its old token/payload does not implement the current authenticated A/B workflow.
 
-## Step-by-step installation
+## Hardware and OS
 
-### 1. Install system packages via apt
+Use Raspberry Pi OS Bookworm **64-bit**, OS Python 3.11, Camera Module 3 and
+an HX711 with a load cell suitable for a 350 g sample. Shut down the Pi before
+connecting the CSI ribbon; use the correct ribbon for the Pi model.
+Keep the normal libcamera camera stack (`camera_auto_detect=1`); do not enable
+legacy camera mode. No camera preview window is opened, preserving touchscreen space.
+
+Default BCM wiring:
+
+| HX711 | Raspberry Pi |
+|---|---|
+| DT / DOUT | GPIO5, physical pin 29 |
+| SCK / PD_SCK | GPIO6, physical pin 31 |
+| GND | GND, physical pin 6 |
+| VCC / digital supply | 3.3 V, physical pin 1 (module must support 3.3 V operation) |
+
+Connect the cell's excitation/signal wires to E+/E−/A+/A− according to its datasheet;
+wire colors vary. GPIO inputs must use 3.3 V logic. For modules with separate analog
+and digital supplies follow the module datasheet and keep the digital supply at 3.3 V.
+
+## Install (Pi 4)
+
+These commands assume the deployment path used by the existing service:
+`/home/pi/CGI`. Substitute your checkout path and service user if different.
 
 ```bash
 sudo apt update
-sudo apt install -y python3-picamera2 python3-rpi.gpio python3-libcamera
+sudo apt install -y python3-venv python3-picamera2 python3-libcamera python3-rpi.gpio python3-pil rpicam-apps
+cd /home/pi/CGI/pi_node
+python3 -m venv --system-site-packages venv
+venv/bin/python -m pip install -r requirements.txt
+# Only on a fresh checkout without config.ini:
+test -f config.ini || cp config.ini.example config.ini
+venv/bin/python -c "from picamera2 import Picamera2; import RPi.GPIO; from hx711 import HX711; print('Drivers imported')"
+rpicam-hello --list-cameras
 ```
 
-### 2. Navigate to the pi_node directory
+For **Pi 5**, use the RPi.GPIO-compatible lgpio implementation instead of the
+Pi 4 RPi.GPIO package (the code keeps the existing `RPi.GPIO` API):
+
+```bash
+sudo apt remove -y python3-rpi.gpio
+sudo apt install -y python3-rpi-lgpio
+```
+
+Edit `config.ini`: set `[hardware] MODE = hardware` (add the section if absent),
+verify DT/SCK pins, and later save calibration with the wizard below. On the
+backend, set the existing `.env` `PI_NODE_URL=http://<PI_LAN_IP>:5000`, then restart
+the backend using your deployment's normal procedure. The browser continues to
+use the existing backend URL and JWT, never the Pi URL directly.
+
+The Pi HTTP service has no user authentication of its own, as in the original
+architecture; expose port 5000 only on the trusted device/backend network.
+
+## Calibration and tare (exact commands)
+
+Stop the service before CLI calibration so there is one GPIO owner:
 
 ```bash
 cd /home/pi/CGI/pi_node
+sudo systemctl stop cgi-node
+CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --calibrate
 ```
 
-### 3. Create the virtual environment
+Follow the prompts: empty tray → ENTER → enter a positive known mass in grams
+(e.g. `350`) → place that mass → ENTER. The wizard saves `ZERO_OFFSET` and
+`CALIBRATION_FACTOR` (raw counts per gram, which may be negative) atomically to
+`config.ini`. No manual factor calculation is needed. Never tare with beans present.
+Calibration factor `1.0` is only a placeholder, not a calibrated scale.
 
 ```bash
-python3 -m venv --system-site-packages venv
-source venv/bin/activate
+# Verify known masses, including near 340 and 360 g; Ctrl+C exits:
+CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py
+# To save only a new empty-tray zero while service is stopped:
+CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --tare
+# Camera smoke test (hardware mode, autofocus, saved JPEG):
+CGI_HARDWARE_MODE=hardware venv/bin/python camera_capture.py /tmp/cgi-camera.jpg
 ```
 
-Your prompt will change to `(venv) pi@cgi-node:...`.
+At runtime use **Tare empty scale** in Stage 2. This operates on the server's scale
+resource and persists the zero across requests/restarts. Empty the tray first;
+the UI then waits for fresh stable weight readings. Do not run CLI calibration
+while the service is active. Recalibrate after mounting/wiring changes and verify
+zero and a known mass after startup.
 
-### 4. Install pip-only packages
+## Start the touchscreen hardware service
 
 ```bash
-pip install -r requirements.txt
-```
-
-Expected output:
-```
-Successfully installed hx711-1.1.2.3 requests-2.31.0
-```
-
-### 5. Verify all four libraries import correctly
-
-```bash
-python3 -c "from picamera2 import Picamera2; print('picamera2 OK')"
-python3 -c "import RPi.GPIO; print('RPi.GPIO OK')"
-python3 -c "from hx711 import HX711; print('hx711 OK')"
-python3 -c "import requests; print('requests OK')"
-```
-
-All four lines must print `OK` with no errors before proceeding.
-
-The current `pi_node` source has no DHT22 import or reader service. If a DHT22 is
-added later, install the driver against the same OS Python/venv and add a hardware
-smoke test here; no unused DHT package is installed by this project today.
-
----
-
-## Troubleshooting
-
-### `ImportError: No module named 'picamera2'` or `RPi`
-
-The venv was created without `--system-site-packages`. Recreate it:
-
-```bash
-deactivate
-rm -rf venv
-python3 -m venv --system-site-packages venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### `ModuleNotFoundError: No module named 'hx711'` or `requests`
-
-The pip install step was skipped or ran outside the active venv:
-
-```bash
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### `apt install python3-picamera2` says "Unable to locate package"
-
-The package index is outdated. Run `sudo apt update` first, then retry.
-
-On very old Raspberry Pi OS images (Bullseye or earlier), the package name is
-`python3-picamera2` on Bookworm only. Upgrade to **Raspberry Pi OS Bookworm 64-bit**
-via Raspberry Pi Imager — Bullseye does not ship Camera Module 3 support by default.
-
-### Camera not detected — `RuntimeError: Camera is not enabled`
-
-Enable the camera interface:
-```bash
-sudo raspi-config
-# Interface Options → Camera → Enable → OK → Finish → Reboot
-```
-
-After rebooting, verify the camera is seen:
-```bash
-libcamera-hello --list-cameras
-```
-
----
-
-## Running the sensor node
-
-**Interactive / development:**
-```bash
-source venv/bin/activate
-python sensor_node.py --once
-```
-
-**Continuous loop (GPIO button or ENTER):**
-```bash
-source venv/bin/activate
-python sensor_node.py
-```
-
-**As a systemd service (production):**
-
-The `cgi-node.service` file already points to `venv/bin/python3` so no manual
-activation is needed when running under systemd:
-
-```bash
-sudo cp cgi-node.service /etc/systemd/system/
+cd /home/pi/CGI/pi_node
+sudo cp cgi-node.service /etc/systemd/system/cgi-node.service
 sudo systemctl daemon-reload
-sudo systemctl enable cgi-node
-sudo systemctl start cgi-node
-sudo systemctl status cgi-node
+sudo systemctl enable --now cgi-node
+sudo systemctl restart cgi-node
+sudo systemctl status cgi-node --no-pager
+sudo journalctl -u cgi-node -n 50 --no-pager
+curl --fail http://127.0.0.1:5000/weight
+curl --fail -H 'Content-Type: application/json' -d '{"view":"A"}' http://127.0.0.1:5000/capture > /tmp/cgi-view-a.json
 ```
 
----
+`cgi-node.service` now launches pi_server.py and forces hardware mode. Ensure its
+User/WorkingDirectory/ExecStart match the checkout and that user has camera/GPIO
+access (normally the `video` and `gpio` groups on Raspberry Pi OS).
 
-## After a fresh `git clone`
+## Development and failure behavior
 
-The `venv/` directory is not committed to Git (it is in `.gitignore`).
-Run the full installation from Step 1 above every time you clone or re-image the Pi.
+On non-Pi hosts `MODE=auto` retains simulation. On a Raspberry Pi auto uses real
+hardware; missing drivers or disconnections never trigger dummy data. To explicitly
+simulate on either host (stop the hardware service first if it owns port 5000):
+
+```bash
+cd /home/pi/CGI/pi_node
+CGI_HARDWARE_MODE=simulation venv/bin/python pi_server.py
+```
+
+The dashboard's existing Development Mode remains a separate UI-only simulation
+without database writes. To exercise real API/database paths with simulated Pi
+hardware, leave dashboard Development Mode **off** and run the simulated Pi server.
+API responses mark simulated readings/captures. These are test images, not meaningful
+YOLO samples.
+
+Scale operations have a 4-second deadline; camera probes 3 seconds and captures
+20 seconds. Failed workers are terminated and reaped before retrying. Each operation
+reopens the device so a repaired connection can recover on retry. Scale and camera
+operations have separate locks. Readiness uses a short (2-second) camera probe cache;
+capture always accesses the camera and reports failures. Scale failures clear stability
+and disable frontend progression; polling never overlaps and ignores outdated responses.
+A stable reading means two consecutive samples differ by at most 0.5 g, not a metrology
+certification. Real HX711 bit timing and accuracy must be checked under deployment load.
+
+## End-to-end verification on the Pi touchscreen
+
+1. Sign in as officer/admin; disable dashboard Development Mode. Select a farmer,
+   check preparation items, and check hardware. Camera and scale must be ready;
+   printer warning remains non-blocking.
+2. Continue to Weight, tare the empty tray, then place 350 g. Confirm live grams
+   stabilize. Below 340 g and above 360 g must block Continue; both boundaries pass.
+3. Continue, capture/accept A, physically reorient the sample, capture/accept B.
+   Verify focus, previews, retake, and both accept actions before Analyze.
+4. Analyze with the deployed trained YOLO model. Verify both raw/annotated images,
+   transaction number, sample grams and transaction kilograms in results/history.
+5. Disconnect the scale/camera between attempts. Recheck must report the affected
+   device unavailable; scale polling/capture must show errors without advancing on
+   stale weight or fabricating an image. Reconnect and retry.
+6. Verify controls and modal scrolling on the physical 7-inch display at its actual
+   resolution; the existing layout is retained with one large tare button.
+
+Automated tests use simulated Pi HTTP, authenticated backend routes, temporary SQLite,
+and mocked detection/pricing to verify A/B delivery and weight persistence. They do
+not validate physical wiring, autofocus quality, calibrated accuracy, deployed MySQL,
+trained-model accuracy, or touchscreen ergonomics.
+
+```bash
+# From repository root, using the backend environment:
+venv/bin/python -m pytest backend/tests/test_hardware_workflow.py backend/tests/test_integration.py -q
+```
+
+Implementation follows the [Picamera2 manual](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf)
+for autofocus/capture. The pinned [HX711 package](https://pypi.org/project/hx711/1.1.2.3/)
+provides `get_raw_data(times=...)`; it does not provide the former reader's
+`tare()` or `get_current_weight()` methods.
+
+Optional reproducible frontend behavior check (Chromium must already be installed):
+
+```bash
+venv/bin/python -m pip install pytest==8.3.5 playwright==1.51.0
+venv/bin/python backend/tests/hardware_frontend_check.py
+```
+
+The browser check loads the existing template/JavaScript at an 800×480 viewport
+with substituted PHP-generated values, Bootstrap modal behavior and API responses.
+It verifies readiness gating, weight range/disconnect recovery, tare, saved grams,
+and A/B acceptance/retake behavior without accessing production data. Physical
+layout and the deployment's Bootstrap assets still require the touchscreen check above.

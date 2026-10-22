@@ -4,12 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/CGI/pi_node
+User=cgi
+WorkingDirectory=/var/www/html/CGI-V2/pi_node
 # Use the venv interpreter so hx711 and requests (pip-installed) are on sys.path.
 # The venv is created with --system-site-packages, so apt-installed picamera2 and
 # RPi.GPIO are also visible.  See pi_node/INSTALL.md for setup instructions.
-ExecStart=/home/pi/CGI/pi_node/venv/bin/python3 /home/pi/CGI/pi_node/sensor_node.py
+ExecStart=/var/www/html/CGI-V2/pi_node/venv/bin/python3 /var/www/html/CGI-V2/pi_node/pi_server.py
+Environment=CGI_HARDWARE_MODE=hardware
 Restart=on-failure
 RestartSec=5
 

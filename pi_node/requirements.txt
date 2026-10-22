@@ -22,3 +22,6 @@ hx711==1.1.2.3
 
 # HTTP client to POST sensor data to the CGI backend
 requests==2.31.0
+
+# JPEG simulation on development hosts (hardware uses OS Picamera2).
+Pillow==10.3.0

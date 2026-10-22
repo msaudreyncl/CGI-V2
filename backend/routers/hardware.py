@@ -27,8 +27,13 @@ settings = get_settings()
 
 async def _pi_get(path: str) -> dict:
     """GET {PI_NODE_URL}{path} and return parsed JSON, or raise on failure."""
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(settings.PI_NODE_URL.rstrip("/") + path)
+        # /weight reports independent readiness even when the scale failed.
+        if path == "/weight" and resp.status_code == 503:
+            data = resp.json()
+            if data.get("scale") == "error":
+                return data
         resp.raise_for_status()
         return resp.json()
 
@@ -81,16 +86,13 @@ async def hardware_status(
         scale:   "ready" | "error"
         printer: "ready" | "warning"   (printer failure is non-blocking)
     """
-    # Camera and scale are both served by the same Pi node /weight endpoint.
-    # If the Pi node is reachable the camera module is also assumed present;
-    # the officer will discover actual camera failures at capture time.
+    data = {}
     try:
-        await _pi_get("/weight")
-        camera_status = "ready"
-        scale_status  = "ready"
+        data = await _pi_get("/weight")
+        camera_status = data.get("camera", "error")
+        scale_status = data.get("scale", "error")
     except Exception:
-        camera_status = "error"
-        scale_status  = "error"
+        camera_status = scale_status = "error"
 
     printer_status = await _check_printer()
 
@@ -98,6 +100,7 @@ async def hardware_status(
         "camera":  camera_status,
         "scale":   scale_status,
         "printer": printer_status,
+        "simulated": data.get("simulated", False),
     }
 
 
@@ -114,7 +117,12 @@ async def get_weight(
         in_range  — True when 340 ≤ weight_g ≤ 360
     """
     try:
-        return await _pi_get("/weight")
+        data = await _pi_get("/weight")
+        if data.get("scale") == "error":
+            raise HTTPException(status_code=503, detail=data.get("error", "Scale unavailable"))
+        return data
+    except HTTPException:
+        raise
     except httpx.ConnectError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -167,3 +175,21 @@ async def trigger_capture(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Pi node error: {exc}",
         )
+
+
+class HardwareWeightAction(BaseModel):
+    action: str
+
+
+@router.post("/weight")
+async def tare_weight(
+    body: HardwareWeightAction,
+    _: User = Depends(require_role(UserRole.admin, UserRole.officer)),
+):
+    """Tare the empty platform using the existing weight resource."""
+    if body.action != "tare":
+        raise HTTPException(status_code=400, detail="action must be tare")
+    try:
+        return await _pi_post("/weight", {"action": "tare"})
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Scale tare failed: {exc}")

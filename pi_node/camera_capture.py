@@ -2,7 +2,7 @@
 camera_capture.py — Pi Camera Module 3 image capture using picamera2.
 
 Captures a single still image and returns the JPEG bytes or saves to a file.
-Falls back to a dummy PNG on non-Pi machines for development testing.
+Uses a simulated JPEG only when the explicit hardware mode policy permits it.
 """
 
 import io
@@ -38,8 +38,9 @@ def capture_image(save_path: Optional[str] = None) -> bytes:
     """
     cfg = _load_config()
 
-    if not _ON_PI:
-        # Development fallback — return a tiny 1x1 white JPEG
+    from hardware_runtime import simulated
+    if simulated(cfg):
+        # Development image — never used to mask hardware failures
         from PIL import Image
         img = Image.new("RGB", (1280, 960), color=(240, 230, 210))
         buf = io.BytesIO()
@@ -49,6 +50,9 @@ def capture_image(save_path: Optional[str] = None) -> bytes:
             with open(save_path, "wb") as f:
                 f.write(data)
         return data
+
+    if not _ON_PI:
+        raise RuntimeError('Picamera2 unavailable; install the Raspberry Pi OS camera packages')
 
     width  = cfg.getint("camera", "RESOLUTION_WIDTH",  fallback=1920)
     height = cfg.getint("camera", "RESOLUTION_HEIGHT", fallback=1080)
@@ -64,6 +68,8 @@ def capture_image(save_path: Optional[str] = None) -> bytes:
 
         # Allow autofocus to settle
         time.sleep(af_wait)
+        if not cam.autofocus_cycle():
+            raise RuntimeError('Camera autofocus failed; check lighting and sample distance')
 
         buf = io.BytesIO()
         cam.capture_file(buf, format="jpeg")
@@ -75,12 +81,30 @@ def capture_image(save_path: Optional[str] = None) -> bytes:
 
         return data
     finally:
-        cam.stop()
+        cam.close()
+
+
+def camera_ready():
+    if not _ON_PI:
+        raise RuntimeError('Picamera2 driver unavailable')
+    cam = Picamera2()
+    try:
+        cam.configure(cam.create_still_configuration())
+        cam.start()
+        cam.capture_metadata()
+        return True
+    finally:
         cam.close()
 
 
 if __name__ == "__main__":
     import sys
     out = sys.argv[1] if len(sys.argv) > 1 else "test_capture.jpg"
-    img_bytes = capture_image(save_path=out)
+    from hardware_runtime import simulated, run_hardware
+    if simulated(_load_config()):
+        img_bytes = capture_image(save_path=out)
+    else:
+        img_bytes = run_hardware('capture', timeout=20)
+        with open(out, 'wb') as stream:
+            stream.write(img_bytes)
     print(f"Captured {len(img_bytes):,} bytes → {out}")

@@ -26,6 +26,8 @@ HX711_DT_PIN  = 5
 HX711_SCK_PIN = 6
 # Calibration factor (run hx711_reader.py --calibrate to find this value)
 CALIBRATION_FACTOR = 1.0
+# Persisted by --tare / --calibrate and the transaction Tare button.
+ZERO_OFFSET = 0
 # Number of readings to average for a stable weight
 READINGS_TO_AVERAGE = 10
 # Acceptable weight range for 350 g sample (grams)
@@ -37,3 +39,7 @@ WEIGHT_MAX_G = 360
 TRIGGER_BUTTON_PIN = 17
 # GPIO pin for status LED (optional)
 STATUS_LED_PIN = 27
+
+[hardware]
+# auto simulates only on non-Pi hosts; hardware never falls back on driver failure.
+MODE = auto

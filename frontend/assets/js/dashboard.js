@@ -132,6 +132,12 @@
         let currentAnalysis  = null;   // DualInspectionOut (real) or DEV mock object
         let farmerName       = null;   // selected farmer display name
         
+        let weightPollGeneration = 0;
+        let weightRequestBusy = false;
+        let weightSaving = false;
+        let tareBusy = false;
+        let weightReadAt = 0;
+        let acceptedA = false, acceptedB = false;
         let weightPollTimer  = null;   // setInterval handle for weight polling
         let analysisRunning  = false;  // guard against duplicate YOLOv8 requests
         
@@ -348,6 +354,8 @@
                 document.getElementById('btn-accept-' + v).classList.add('d-none');
                 document.getElementById('view-' + v + '-countdown').classList.add('d-none');
             });
+            acceptedA = acceptedB = false;
+            document.getElementById('btn-capture-a').disabled = false;
             document.getElementById('btn-capture-b').disabled = true;
             document.getElementById('reorient-instruction').classList.add('d-none');
             ['camera','scale','printer'].forEach(k => {
@@ -485,10 +493,14 @@
         
         function _startWeightPoll() {
             _stopWeightPoll();
+            currentWeight = null;
+            document.getElementById('btn-to-capture').disabled = true;
             weightPollTimer = setInterval(_pollWeight, 500);
+            _pollWeight();
         }
         
         function _stopWeightPoll() {
+            weightPollGeneration++;
             if (weightPollTimer) {
                 clearInterval(weightPollTimer);
                 weightPollTimer = null;
@@ -496,46 +508,85 @@
         }
         
         async function _pollWeight() {
-            let w, stable, inRange;
+            if (weightRequestBusy || weightSaving || tareBusy || !weightPollTimer) return;
+            const generation = weightPollGeneration;
+            weightRequestBusy = true;
+            try {
+                let w, stable, inRange;
         
-            if (devMode) {
-                // Simulate weight ramping to a stable 350 g
-                ({ weight_g: w, stable, in_range: inRange } = DEV.getWeight());
-            } else {
-                try {
-                    const resp = await API.get('/api/hardware/weight');
-                    if (!resp.ok) return;
-                    const data = await resp.json();
-                    w = parseFloat(data.weight_g);
-                    stable  = data.stable;
-                    inRange = data.in_range;
-                } catch (e) {
-                    document.getElementById('live-weight-value').textContent = '— g';
-                    document.getElementById('weight-status-badge').innerHTML =
-                        '<span class="badge bg-secondary">Scale unreachable</span>';
-                    return;
+                if (devMode) {
+                    // Simulate weight ramping to a stable 350 g
+                    ({ weight_g: w, stable, in_range: inRange } = DEV.getWeight());
+                } else {
+                    try {
+                        const resp = await API.get('/api/hardware/weight');
+                        if (!resp.ok) throw new Error('Scale unavailable');
+                        const data = await resp.json();
+                        if (generation !== weightPollGeneration) return;
+                        w = Number(data.weight_g);
+                        if (data.weight_g == null || !Number.isFinite(w)) throw new Error('Invalid weight');
+                        stable  = data.stable;
+                        inRange = data.in_range;
+                    } catch (e) {
+                        if (generation !== weightPollGeneration) return;
+                        currentWeight = null;
+                        document.getElementById('btn-to-capture').disabled = true;
+                        document.getElementById('live-weight-value').textContent = '— g';
+                        document.getElementById('weight-status-badge').innerHTML =
+                            '<span class="badge bg-secondary">Scale unreachable</span>';
+                        return;
+                    }
                 }
+        
+                document.getElementById('live-weight-value').textContent = w.toFixed(1) + ' g';
+        
+                let badgeHtml = '';
+                if (w < 340) {
+                    badgeHtml = '<span class="badge bg-danger fs-6">Insufficient — add beans</span>';
+                } else if (w > 360) {
+                    badgeHtml = '<span class="badge bg-danger fs-6">Excess — remove beans</span>';
+                } else if (!stable) {
+                    badgeHtml = '<span class="badge bg-warning text-dark fs-6">Stabilizing…</span>';
+                } else {
+                    badgeHtml = '<span class="badge bg-success fs-6">✓ Valid — proceed</span>' +
+                                (devMode ? ' <span class="badge bg-warning text-dark">Simulated</span>' : '');
+                }
+                document.getElementById('weight-status-badge').innerHTML = badgeHtml;
+
+                const canProceed = inRange && stable && Number.isFinite(w) && w >= 340 && w <= 360;
+                document.getElementById('btn-to-capture').disabled = !canProceed;
+                currentWeight = canProceed ? w : null;
+                weightReadAt = Date.now();
+            } finally {
+                weightRequestBusy = false;
             }
-        
-            document.getElementById('live-weight-value').textContent = w.toFixed(1) + ' g';
-        
-            let badgeHtml = '';
-            if (w < 340) {
-                badgeHtml = '<span class="badge bg-danger fs-6">Insufficient — add beans</span>';
-            } else if (w > 360) {
-                badgeHtml = '<span class="badge bg-danger fs-6">Excess — remove beans</span>';
-            } else if (!stable) {
-                badgeHtml = '<span class="badge bg-warning text-dark fs-6">Stabilizing…</span>';
-            } else {
-                badgeHtml = '<span class="badge bg-success fs-6">✓ Valid — proceed</span>' +
-                            (devMode ? ' <span class="badge bg-warning text-dark">Simulated</span>' : '');
-            }
-            document.getElementById('weight-status-badge').innerHTML = badgeHtml;
-        
-            const canProceed = inRange && stable;
-            document.getElementById('btn-to-capture').disabled = !canProceed;
-            if (canProceed) currentWeight = w;
         }
+
+        document.getElementById('btn-tare-scale').addEventListener('click', async () => {
+            if (tareBusy || weightSaving) return;
+            tareBusy = true;
+            _stopWeightPoll();
+            currentWeight = null;
+            document.getElementById('btn-to-capture').disabled = true;
+            document.getElementById('btn-tare-scale').disabled = true;
+            _hideError('stage2-error');
+            try {
+                if (devMode) DEV.resetWeight();
+                else {
+                    const resp = await API.post('/api/hardware/weight', { action: 'tare' });
+                    if (!resp.ok) {
+                        const err = await resp.json();
+                        throw new Error(err.detail || 'Tare failed');
+                    }
+                }
+            } catch (e) {
+                _showError('stage2-error', e.message);
+            } finally {
+                tareBusy = false;
+                document.getElementById('btn-tare-scale').disabled = false;
+                if (document.getElementById('stage-2').classList.contains('d-none') === false) _startWeightPoll();
+            }
+        });
         
         document.getElementById('btn-back-to-prepare').addEventListener('click', () => {
             _stopWeightPoll();
@@ -544,11 +595,15 @@
         });
         
         document.getElementById('btn-to-capture').addEventListener('click', async () => {
+            if (currentWeight === null || Date.now() - weightReadAt > 10000 || weightSaving || tareBusy) return;
+            _stopWeightPoll();
+            weightSaving = true;
             _hideError('stage2-error');
             document.getElementById('btn-to-capture').disabled = true;
         
             if (devMode) {
                 // Skip weight persistence API call in dev mode
+                weightSaving = false;
                 _stopWeightPoll();
                 _setStage(3);
                 return;
@@ -561,15 +616,18 @@
                 if (!resp.ok) {
                     const err = await resp.json();
                     _showError('stage2-error', err.detail || 'Failed to save weight.');
-                    document.getElementById('btn-to-capture').disabled = false;
+                    weightSaving = false;
+                    _startWeightPoll();
                     return;
                 }
             } catch (e) {
                 _showError('stage2-error', 'Network error: ' + e.message);
-                document.getElementById('btn-to-capture').disabled = false;
+                weightSaving = false;
+                _startWeightPoll();
                 return;
             }
         
+            weightSaving = false;
             _stopWeightPoll();
             _setStage(3);
         });
@@ -650,8 +708,8 @@
             document.getElementById('btn-capture-' + vl).disabled = false;
             document.getElementById('view-' + vl + '-badge').textContent = 'Pending';
             document.getElementById('view-' + vl + '-badge').className   = 'badge bg-secondary';
-            if (view === 'A') { imageAb64 = null; }
-            else              { imageBb64 = null; }
+            if (view === 'A') { imageAb64 = null; acceptedA = false; }
+            else              { imageBb64 = null; acceptedB = false; }
             document.getElementById('btn-to-analyze').disabled = true;
             _hideError('stage3-error');
         }
@@ -665,11 +723,13 @@
             document.getElementById('btn-accept-' + vl).classList.add('d-none');
             document.getElementById('btn-capture-' + vl).disabled = true;
         
+            if (view === 'A') acceptedA = true;
+            else acceptedB = true;
             if (view === 'A') {
                 document.getElementById('reorient-instruction').classList.remove('d-none');
                 document.getElementById('btn-capture-b').disabled = false;
             }
-            if (imageAb64 && imageBb64) {
+            if (imageAb64 && imageBb64 && acceptedA && acceptedB) {
                 document.getElementById('btn-to-analyze').disabled = false;
             }
         }
@@ -680,6 +740,10 @@
         document.getElementById('btn-accept-b').addEventListener('click', () => _acceptView('B'));
         
         document.getElementById('btn-back-to-weight').addEventListener('click', () => {
+            _retakeView('A');
+            _retakeView('B');
+            document.getElementById('btn-capture-b').disabled = true;
+            document.getElementById('reorient-instruction').classList.add('d-none');
             _setStage(2);
             _startWeightPoll();
         });

@@ -12,6 +12,9 @@ import configparser
 import os
 import sys
 import time
+import math
+import statistics
+import tempfile
 
 try:
     import RPi.GPIO as GPIO
@@ -44,22 +47,46 @@ def _build_hx711(cfg: configparser.ConfigParser):
     return hx
 
 
-def tare(hx, readings: int = 10) -> float:
-    """Tare the scale and return the raw offset."""
-    print("Taring — keep the scale empty...")
-    time.sleep(1)
-    hx.tare(times=readings)
-    offset = hx.get_current_weight(readings)
-    print(f"Tare complete. Offset reading: {offset:.2f}")
+def raw_mean(hx, readings=10):
+    # hx711==1.1.2.3 exposes raw samples, not tare/get_current_weight.
+    values = hx.get_raw_data(times=readings)
+    if not values or len(values) != readings or any(
+        isinstance(v, bool) or not math.isfinite(v) or v in (-8388608, 8388607)
+        for v in values
+    ):
+        raise RuntimeError("Invalid HX711 readings; check wiring")
+    return statistics.mean(values)
+
+
+def save_scale_config(cfg):
+    # Atomic replacement avoids partially written calibration after power loss.
+    fd, path = tempfile.mkstemp(dir=os.path.dirname(CONFIG_PATH), prefix='.scale-')
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            cfg.write(stream)
+        os.replace(path, CONFIG_PATH)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def tare(hx, readings=10):
+    cfg = _load_config()
+    offset = raw_mean(hx, readings)
+    cfg.set('load_cell', 'ZERO_OFFSET', str(offset))
+    save_scale_config(cfg)
     return offset
 
 
-def read_weight_g(hx, cfg: configparser.ConfigParser) -> float:
-    """Return a stable weight reading in grams."""
-    cal_factor   = cfg.getfloat("load_cell", "CALIBRATION_FACTOR")
-    n_readings   = cfg.getint("load_cell",   "READINGS_TO_AVERAGE")
-    raw = hx.get_current_weight(n_readings)
-    return raw / cal_factor
+def read_weight_g(hx, cfg):
+    factor = cfg.getfloat('load_cell', 'CALIBRATION_FACTOR')
+    if not math.isfinite(factor) or factor == 0:
+        raise ValueError('CALIBRATION_FACTOR must be finite and nonzero')
+    offset = cfg.getfloat('load_cell', 'ZERO_OFFSET', fallback=0)
+    weight = (raw_mean(hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE')) - offset) / factor
+    if not math.isfinite(weight):
+        raise ValueError('Invalid scale calibration or reading')
+    return weight
 
 
 def is_weight_in_range(weight_g: float, cfg: configparser.ConfigParser) -> bool:
@@ -69,73 +96,41 @@ def is_weight_in_range(weight_g: float, cfg: configparser.ConfigParser) -> bool:
     return w_min <= weight_g <= w_max
 
 
-def calibrate():
-    """Interactive calibration wizard. Prints the calibration factor to use in config.ini."""
-    cfg = _load_config()
-    if not _ON_PI:
-        print("Calibration requires a real Raspberry Pi with HX711 connected.")
-        sys.exit(1)
-
-    hx = _build_hx711(cfg)
-    n  = cfg.getint("load_cell", "READINGS_TO_AVERAGE")
-
-    print("=== HX711 Calibration Wizard ===")
-    print("Step 1: Remove all weight from the scale.")
-    input("Press ENTER when ready...")
-    hx.tare(times=n)
-    print("Tare set.\n")
-
-    known_weight = float(input("Step 2: Place a known weight (in grams) on the scale.\nEnter the known weight in grams: "))
-    input("Place the weight now, then press ENTER...")
-    time.sleep(0.5)
-
-    raw = hx.get_current_weight(n)
-    if raw == 0:
-        print("ERROR: Raw reading is 0. Check wiring.")
-        sys.exit(1)
-
-    cal_factor = raw / known_weight
-    print(f"\nCalibration factor: {cal_factor:.6f}")
-    print(f"Update CALIBRATION_FACTOR = {cal_factor:.6f} in config.ini")
-
-    GPIO.cleanup()
-
-
 def main():
-    parser = argparse.ArgumentParser(description="HX711 weight reader")
-    parser.add_argument("--tare",      action="store_true", help="Tare the scale")
-    parser.add_argument("--calibrate", action="store_true", help="Run calibration wizard")
+    from hardware_runtime import run_hardware, simulated
+    parser = argparse.ArgumentParser(description="HX711 reader (grams)")
+    parser.add_argument('--tare', action='store_true')
+    parser.add_argument('--calibrate', action='store_true')
     args = parser.parse_args()
-
-    if args.calibrate:
-        calibrate()
-        return
-
-    if not _ON_PI:
-        print("[SIMULATION] Not running on a Pi — returning dummy weight of 350.0 g")
-        return 350.0
-
     cfg = _load_config()
-    hx  = _build_hx711(cfg)
-
-    if args.tare:
-        tare(hx, cfg.getint("load_cell", "READINGS_TO_AVERAGE"))
-        GPIO.cleanup()
+    if simulated(cfg):
+        if args.tare or args.calibrate:
+            parser.error('Calibration/tare requires hardware mode on a Raspberry Pi')
+        print('[SIMULATION] 350.0 g')
         return
-
-    print("Reading weight continuously (Ctrl+C to stop)...")
+    if args.tare or args.calibrate:
+        input('Remove all weight, leave the empty tray, then press ENTER: ')
+        offset = run_hardware('tare')
+        if args.calibrate:
+            known = float(input('Known calibration mass in grams: '))
+            if not math.isfinite(known) or known <= 0:
+                raise ValueError('Known mass must be positive and finite')
+            input('Place the known mass, then press ENTER: ')
+            factor = (run_hardware('raw') - offset) / known
+            if not math.isfinite(factor) or factor == 0:
+                raise ValueError('No load response; check wiring')
+            cfg.set('load_cell', 'CALIBRATION_FACTOR', str(factor))
+        cfg.set('load_cell', 'ZERO_OFFSET', str(offset))
+        save_scale_config(cfg)
+        print('Saved calibration/zero to config.ini')
+        return
     try:
         while True:
-            weight = read_weight_g(hx, cfg)
-            in_range = is_weight_in_range(weight, cfg)
-            status = "OK" if in_range else "OUT OF RANGE"
-            print(f"Weight: {weight:.1f} g  [{status}]")
+            print(f"{run_hardware('weight'):.2f} g")
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
-    finally:
-        GPIO.cleanup()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
