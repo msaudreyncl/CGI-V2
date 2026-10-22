@@ -18,14 +18,22 @@ def simulated(cfg):
 
 def _worker(conn, operation):
     try:
-        from hx711_reader import _load_config, _build_hx711, read_weight_g, raw_mean
+        from hx711_reader import _load_config, _build_hx711, read_weight_g, raw_mean, tare
         cfg = _load_config()
         if operation in ('weight', 'tare', 'raw'):
             import RPi.GPIO as GPIO
             try:
                 hx = _build_hx711(cfg)
-                result = read_weight_g(hx, cfg) if operation == 'weight' else raw_mean(
-                    hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE'))
+                if operation == 'weight':
+                    result = read_weight_g(hx, cfg)
+                elif operation == 'tare':
+                    # tare() takes more samples for a stable baseline and saves
+                    # the new offset to config.ini from inside this child process.
+                    result = tare(hx, readings=cfg.getint(
+                        'load_cell', 'READINGS_TO_AVERAGE', fallback=20))
+                else:  # 'raw'
+                    result = raw_mean(hx, cfg.getint(
+                        'load_cell', 'READINGS_TO_AVERAGE', fallback=10))
             finally:
                 GPIO.cleanup()
         else:
@@ -38,7 +46,7 @@ def _worker(conn, operation):
         conn.close()
 
 
-def run_hardware(operation, timeout=4.0):
+def run_hardware(operation, timeout=12.0):
     # A stuck driver must not monopolize the HTTP server or race a retry on GPIO.
     ctx = multiprocessing.get_context('spawn')
     parent, child = ctx.Pipe(duplex=False)

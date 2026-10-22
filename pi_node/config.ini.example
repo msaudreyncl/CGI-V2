@@ -29,12 +29,14 @@ AUTOFOCUS_WAIT = 1.5
 HX711_DT_PIN  = 5
 # GPIO clock pin connected to HX711 SCK
 HX711_SCK_PIN = 6
-# Calibration factor (run hx711_reader.py --calibrate to find this value)
+# Calibration factor (run hx711_reader.py --calibrate to find this value).
+# May be negative — sign depends on load cell wiring orientation.
 CALIBRATION_FACTOR = 1.0
 # Persisted by --tare / --calibrate and the transaction Tare button.
 ZERO_OFFSET = 0
-# Number of readings to average for a stable weight
-READINGS_TO_AVERAGE = 10
+# Samples collected per weight reading (more = slower but smoother).
+# The reader collects READINGS_TO_AVERAGE + 4 samples and discards outliers.
+READINGS_TO_AVERAGE = 20
 # Acceptable weight range for 350 g sample (grams)
 WEIGHT_MIN_G = 340
 WEIGHT_MAX_G = 360
