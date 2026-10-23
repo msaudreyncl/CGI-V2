@@ -102,13 +102,7 @@ def _tare():
         if _calibration and time.monotonic() < _calibration['expires']:
             raise ValueError('Finish or cancel calibration before taring')
         if not simulated(cfg):
-<<<<<<< Updated upstream
-            # tare() inside the child process saves the new ZERO_OFFSET to
-            # config.ini atomically; no second write is needed here.
-            run_hardware('tare')
-=======
             _scale_worker.request('tare')
->>>>>>> Stashed changes
         _last_weight = None
     return {'tared': True, 'simulated': simulated(cfg)}
 
@@ -185,6 +179,14 @@ class PiRequestHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        try:
+            self._get_readiness()
+        except Exception as exc:
+            # Configuration/probe failures must return JSON, not close the socket.
+            self._send_json(503, {'scale': 'error', 'camera': 'error',
+                                  'error': str(exc), 'camera_error': str(exc)})
+
+    def _get_readiness(self):
         if self.path != '/weight':
             return self._send_json(404, {'error': 'Not found'})
         # Check devices concurrently so a slow/disconnected scale cannot consume
