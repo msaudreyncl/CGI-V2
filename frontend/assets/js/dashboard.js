@@ -347,7 +347,9 @@
         }
         
         function _staticUrl(relPath) {
-            return '/static/' + relPath.replace(/^static\//, '');
+            if (/^(https?:|data:|blob:)/i.test(relPath)) return relPath;
+            return (window.CGI_API_BASE || '').replace(/\/$/, '') +
+                '/static/' + relPath.replace(/^\/?static\//, '');
         }
         
         function _resetModal() {
@@ -959,19 +961,35 @@
                 tbody.appendChild(tr);
             }
         
-            // Images — in dev mode show the placeholder SVGs stored in state
-            function _setImg(imgId, linkId, relOrDataPath) {
-                if (!relOrDataPath) {
-                    document.getElementById(imgId).src = '';
-                    document.getElementById(linkId).style.display = 'none';
-                    return;
-                }
-                const url = relOrDataPath.startsWith('data:') ? relOrDataPath : _staticUrl(relOrDataPath);
-                document.getElementById(imgId).src   = url;
-                document.getElementById(linkId).href = url;
-                document.getElementById(linkId).style.display = '';
+            // Keep each accepted capture available if Apache cannot serve its saved URL.
+            function _setImg(imgId, linkId, path, captured = null) {
+                const img = document.getElementById(imgId);
+                const link = document.getElementById(linkId);
+                const fallback = captured && (captured.startsWith('data:')
+                    ? captured : 'data:image/jpeg;base64,' + captured);
+                const url = path ? _staticUrl(path) : fallback;
+                img.onload = null;
+                img.onerror = null;
+                img.hidden = !url;
+                link.style.display = url ? '' : 'none';
+                link.removeAttribute('href');
+                img.removeAttribute('src');
+                if (!url) return;
+                img.onerror = () => {
+                    if (fallback && img.getAttribute('src') !== fallback) {
+                        link.href = fallback;
+                        img.src = fallback;
+                        return;
+                    }
+                    img.onerror = null;
+                    img.hidden = true;
+                    link.removeAttribute('href');
+                    link.style.display = 'none';
+                };
+                link.href = url;
+                img.src = url;
             }
-        
+
             if (devMode) {
                 // Show the captured placeholder images; annotated thumbnails = same placeholder
                 _setImg('res-img-a',     'res-img-a-link',     imageAb64);
@@ -979,9 +997,9 @@
                 _setImg('res-img-b',     'res-img-b-link',     imageBb64);
                 _setImg('res-img-b-ann', 'res-img-b-ann-link', DEV._makePlaceholderImg('View B — Annotated'));
             } else {
-                _setImg('res-img-a',     'res-img-a-link',     data.image_path);
+                _setImg('res-img-a',     'res-img-a-link',     data.image_path, imageAb64);
                 _setImg('res-img-a-ann', 'res-img-a-ann-link', data.image_path_annotated_a);
-                _setImg('res-img-b',     'res-img-b-link',     data.image_path_b);
+                _setImg('res-img-b',     'res-img-b-link',     data.image_path_b, imageBb64);
                 _setImg('res-img-b-ann', 'res-img-b-ann-link', data.image_path_annotated_b);
             }
         
