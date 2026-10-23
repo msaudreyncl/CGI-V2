@@ -46,6 +46,7 @@ class Settings:
 
     # YOLOv8
     YOLO_MODEL_PATH:  str   = _project_path(os.getenv("YOLO_MODEL_PATH", "models/cgi_yolov8.pt"))
+    YOLO_ALLOW_MISSING_MODEL: bool = os.getenv("YOLO_ALLOW_MISSING_MODEL", "false").lower() == "true"
     YOLO_CONFIDENCE:  float = float(os.getenv("YOLO_CONFIDENCE", "0.50"))
 
     # File storage
@@ -75,6 +76,8 @@ class Settings:
         for o in os.getenv("CORS_ORIGINS", "http://localhost,http://localhost:8080,http://127.0.0.1,http://127.0.0.1:8080").split(",")
         if o.strip()
     ]
+
+    WEIGHT_TEST_MODE: bool = os.getenv("WEIGHT_TEST_MODE", "false").lower() == "true"
 
     # Weight enforcement
     WEIGHT_MIN_G: float = 340.0

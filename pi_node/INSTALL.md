@@ -25,6 +25,16 @@ The old `sensor_node.py` is a legacy single-image push utility, not the touchscr
 transaction service. Do not run it beside pi_server.py: both would own the GPIO/camera,
 and its old token/payload does not implement the current authenticated A/B workflow.
 
+## Scale sampling cadence
+
+The shared HX711 reader spaces acquisition attempts by at least 12.5 ms (80 Hz)
+for weight reads, tare, and calibration, including across consecutive batches.
+Set the HX711 module's RATE input HIGH/DVDD for its native 80 Hz conversion mode;
+software pacing does not change the chip's hardware conversion rate.
+`READINGS_TO_AVERAGE = 10` is a sample count, not a frequency: a ten-sample
+batch takes about 0.125 seconds, and a three-batch calibration reference about
+0.375 seconds. GPIO delays or retries can reduce the achieved rate.
+
 ## Hardware and OS
 
 Use Raspberry Pi OS Bookworm **64-bit**, OS Python 3.11, Camera Module 3 and
@@ -90,26 +100,28 @@ sudo systemctl stop cgi-node
 CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --calibrate
 ```
 
-Follow the prompts: empty tray → ENTER → enter a positive known mass in grams
-(e.g. `350`) → place that mass → ENTER. The wizard saves `ZERO_OFFSET` and
-`CALIBRATION_FACTOR` (raw counts per gram, which may be negative) atomically to
-`config.ini`. No manual factor calculation is needed. Never tare with beans present.
-Calibration factor `1.0` is only a placeholder, not a calibrated scale.
+The updated wizard requires a **bare-platform reference**, a known mass, loaded
+verification and a return-to-zero check. Remove the removable tray for calibration;
+then weigh the empty tray and tare it separately. Recalibrate once after deploying
+the verified-calibration update; older factors are not silently trusted.
+
+See [WEIGHT_CALIBRATION.md](WEIGHT_CALIBRATION.md) for the complete commands,
+noise/polarity audit, tray/beans test sequence and verification limits.
 
 ```bash
-# Verify known masses, including near 340 and 360 g; Ctrl+C exits:
+# Raw counts/spread without requiring calibration (Ctrl+C to exit):
+CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --raw
+# Signed grams after calibration (Ctrl+C to exit):
 CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py
-# To save only a new empty-tray zero while service is stopped:
+# Tare the empty tray while the service is stopped:
 CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --tare
-# Camera smoke test (configured focus mode, saved JPEG):
+# Camera smoke test:
 CGI_HARDWARE_MODE=hardware venv/bin/python camera_capture.py /tmp/cgi-camera.jpg
 ```
 
-At runtime use **Tare empty scale** in Stage 2. This operates on the server's scale
-resource and persists the zero across requests/restarts. Empty the tray first;
-the UI then waits for fresh stable weight readings. Do not run CLI calibration
-while the service is active. Recalibrate after mounting/wiring changes and verify
-zero and a known mass after startup.
+At runtime use **Tare empty scale** in Step 2 with the tray present and beans
+removed. Tare persists only after stable batches and a fresh zero verification.
+Do not run CLI calibration while the service is active.
 
 ## Start the touchscreen hardware service
 
@@ -146,7 +158,7 @@ hardware, leave dashboard Development Mode **off** and run the simulated Pi serv
 API responses mark simulated readings/captures. These are test images, not meaningful
 YOLO samples.
 
-Scale operations have a 4-second deadline; camera readiness has an 8-second
+Scale reads have an 8-second deadline; verified tare allows 25 seconds; camera readiness has an 8-second
 first-frame deadline and capture/preview requests a 20-second deadline. Failed
 camera workers are terminated and reaped, then recreated on the next request.
 Scale and camera operations have separate locks. Readiness uses a short (2-second)
@@ -188,8 +200,9 @@ images and corresponding transaction data through the existing database workflow
 The standalone `camera-test/` directory is for terminal tests; transaction image
 storage stays in the backend's configured `UPLOAD_DIR`.
 
-A stable weight means two consecutive samples differ by at most 0.5 g, not a
-metrology certification. Verify physical accuracy under deployment load.
+Stable weight requires a filtered within-batch spread of at most 0.5 g and two
+consecutive readings within 0.5 g. This is not a metrology certification; verify
+physical accuracy with independent known masses under deployment load.
 
 ## End-to-end verification on the Pi touchscreen
 

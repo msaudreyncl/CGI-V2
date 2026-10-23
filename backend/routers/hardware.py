@@ -10,7 +10,7 @@ Hardware gate rules (per spec §1.3 confirmed design):
 """
 
 import asyncio
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, status
 
 import httpx
@@ -40,7 +40,7 @@ async def _pi_get(path: str) -> dict:
 
 async def _pi_post(path: str, body: dict) -> dict:
     """POST {PI_NODE_URL}{path} with JSON body, return parsed JSON."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=55.0 if path == "/weight" else 30.0) as client:
         resp = await client.post(
             settings.PI_NODE_URL.rstrip("/") + path,
             json=body,
@@ -138,6 +138,9 @@ async def get_weight(
         data = await _pi_get("/weight")
         if data.get("scale") == "error":
             raise HTTPException(status_code=503, detail=data.get("error", "Scale unavailable"))
+        data["weight_test_mode"] = (settings.WEIGHT_TEST_MODE and
+                                    data.get("weight_test_mode") is True and
+                                    data.get("simulated") is False)
         return data
     except HTTPException:
         raise
@@ -199,6 +202,8 @@ async def trigger_capture(
 
 class HardwareWeightAction(BaseModel):
     action: str
+    known_g: float | None = Field(default=None, gt=0, allow_inf_nan=False, strict=True)
+    token: str | None = None
 
 
 @router.post("/weight")
@@ -206,10 +211,13 @@ async def tare_weight(
     body: HardwareWeightAction,
     _: User = Depends(require_role(UserRole.admin, UserRole.officer)),
 ):
-    """Tare the empty platform using the existing weight resource."""
-    if body.action != "tare":
-        raise HTTPException(status_code=400, detail="action must be tare")
+    """Tare or calibrate through the existing weight resource."""
+    if body.action not in ("tare", "calibration_zero", "calibration_load",
+                            "calibration_finish", "calibration_cancel"):
+        raise HTTPException(status_code=400, detail="Unknown scale action")
     try:
-        return await _pi_post("/weight", {"action": "tare"})
+        return await _pi_post("/weight", body.model_dump(exclude_none=True))
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=503, detail=exc.response.json().get("error", "Scale action failed"))
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Scale tare failed: {exc}")
+        raise HTTPException(status_code=503, detail=f"Scale action failed: {exc}")

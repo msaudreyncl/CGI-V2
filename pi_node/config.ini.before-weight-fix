@@ -1,0 +1,25 @@
+[server]
+server_url = http://127.0.0.1:8000
+pi_node_token = CHANGE_ME
+pi_server_host = 0.0.0.0
+pi_server_port = 5000
+
+[camera]
+resolution_width = 1920
+resolution_height = 1080
+image_format = jpeg
+autofocus_wait = 1.5
+
+[load_cell]
+hx711_dt_pin = 5
+hx711_sck_pin = 6
+calibration_factor = -4.978260869565218
+readings_to_average = 10
+weight_min_g = 340
+weight_max_g = 360
+zero_offset = 71904.9
+
+[gpio]
+trigger_button_pin = 17
+status_led_pin = 27
+

@@ -6,15 +6,21 @@ empty platform. POST /capture accepts view A or B. Run one server per Pi.
 import base64
 import json
 import math
+import secrets
+from datetime import datetime, timezone
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from hardware_runtime import CameraWorker, run_hardware, simulated
-from hx711_reader import _load_config, save_scale_config
+from hardware_runtime import CameraWorker, ScaleWorker, simulated
+from hx711_reader import (_load_config, UnstableScaleError, calibration_values,
+                          derive_calibration, verify_reference, save_scale_config, weight_test_mode)
 
 _scale_lock = threading.Lock()
+_scale_worker = ScaleWorker()
 _camera_lock = threading.Lock()
+_calibration = None
 _last_weight = None
 _last_read_at = 0
 _camera_checked_at = 0
@@ -25,10 +31,20 @@ _camera_worker = CameraWorker()
 
 def _read_weight():
     global _last_weight, _last_read_at
-    cfg = _load_config()
     with _scale_lock:
         try:
-            weight = 350.0 if simulated(cfg) else run_hardware('weight')
+            cfg = _load_config()
+            if _calibration and time.monotonic() < _calibration['expires']:
+                raise UnstableScaleError('Calibration in progress')
+            if not simulated(cfg) and not weight_test_mode(cfg):
+                try:
+                    calibration_values(cfg)
+                except ValueError:
+                    # A responding ADC can be calibrated in Step 2 even before
+                    # it has a valid grams conversion. Never fabricate a weight.
+                    _scale_worker.request('probe')
+                    raise UnstableScaleError('Calibration required — calibrate the scale in Step 2')
+            weight = 350.0 if simulated(cfg) else _scale_worker.request('weight')
             if not math.isfinite(weight):
                 raise ValueError('Scale returned a nonfinite reading')
             now = time.monotonic()
@@ -83,12 +99,77 @@ def _tare():
     global _last_weight
     with _scale_lock:
         cfg = _load_config()
+        if _calibration and time.monotonic() < _calibration['expires']:
+            raise ValueError('Finish or cancel calibration before taring')
         if not simulated(cfg):
+<<<<<<< Updated upstream
             # tare() inside the child process saves the new ZERO_OFFSET to
             # config.ini atomically; no second write is needed here.
             run_hardware('tare')
+=======
+            _scale_worker.request('tare')
+>>>>>>> Stashed changes
         _last_weight = None
     return {'tared': True, 'simulated': simulated(cfg)}
+
+
+def _weight_action(body):
+    """Use the existing weight resource; save only after load and zero checks."""
+    global _calibration, _last_weight
+    action = body['action']
+    if action == 'tare':
+        return _tare()
+    with _scale_lock:
+        _last_weight = None
+        cfg = _load_config()
+        if simulated(cfg):
+            raise ValueError('Calibration requires real HX711 hardware; disable simulation')
+        if action == 'calibration_zero':
+            if _calibration and time.monotonic() < _calibration['expires']:
+                raise ValueError('Calibration already active; finish or cancel it')
+            empty = _scale_worker.request('reference')
+            _calibration = {'token': secrets.token_urlsafe(24), 'empty': empty,
+                            'expires': time.monotonic() + 600, 'stage': 'load'}
+            return {'token': _calibration['token'], 'stage': 'load'}
+        session = _calibration
+        if not session or body.get('token') != session['token']:
+            raise ValueError('Calibration session missing; start again')
+        if action == 'calibration_cancel':
+            _calibration = None
+            return {'cancelled': True}
+        if time.monotonic() >= session['expires']:
+            _calibration = None
+            raise ValueError('Calibration expired; start again')
+        if action == 'calibration_load':
+            if session['stage'] != 'load':
+                raise ValueError('Remove the reference mass and verify zero')
+            known = body.get('known_g')
+            if isinstance(known, bool) or not isinstance(known, (float, int)):
+                raise ValueError('Known mass must be positive and finite')
+            if not math.isfinite(known) or known <= 0:
+                raise ValueError('Known mass must be positive and finite')
+            loaded = _scale_worker.request('reference')
+            factor = derive_calibration(session['empty'], loaded, known, cfg)
+            check = _scale_worker.request('reference')
+            verify_reference(check, loaded, factor, cfg, 'Loaded verification')
+            session.update(stage='finish', factor=factor, known=known)
+            return {'stage': 'finish'}
+        if action == 'calibration_finish':
+            if session['stage'] != 'finish':
+                raise ValueError('Measure the known reference mass first')
+            zero = _scale_worker.request('reference')
+            verify_reference(zero, session['empty'], session['factor'], cfg, 'Zero return')
+            for key, value in {
+                'CALIBRATION_FACTOR': session['factor'], 'ZERO_OFFSET': zero['raw'],
+                'BASE_ZERO_OFFSET': zero['raw'], 'CALIBRATION_MASS_G': session['known'],
+                'CALIBRATED_AT': datetime.now(timezone.utc).isoformat(),
+                'CALIBRATION_VERIFIED': 'true',
+            }.items():
+                cfg.set('load_cell', key, str(value))
+            save_scale_config(cfg)
+            _calibration = None
+            return {'calibrated': True, 'simulated': False}
+        raise ValueError('Unknown scale action')
 
 
 class PiRequestHandler(BaseHTTPRequestHandler):
@@ -106,16 +187,29 @@ class PiRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path != '/weight':
             return self._send_json(404, {'error': 'Not found'})
-        payload = {'camera': _camera_readiness(), 'camera_error': _camera_error,
-                   'scale': 'error', 'simulated': simulated(_load_config())}
-        try:
-            weight, stable, in_range = _read_weight()
-            payload.update(weight_g=round(weight, 2), stable=stable,
-                           in_range=in_range, scale='ready')
-            self._send_json(200, payload)
-        except Exception as exc:
-            payload.update(error=str(exc), weight_g=None, stable=False, in_range=False)
-            self._send_json(503, payload)
+        # Check devices concurrently so a slow/disconnected scale cannot consume
+        # the camera's portion of the backend's readiness timeout.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            camera = pool.submit(_camera_readiness)
+            cfg = _load_config()
+            payload = {'scale': 'error', 'simulated': simulated(cfg),
+                       'weight_test_mode': weight_test_mode(cfg) and not simulated(cfg)}
+            code = 200
+            try:
+                weight, stable, in_range = _read_weight()
+                payload.update(weight_g=weight, measured_at=datetime.now(timezone.utc).isoformat(), stable=stable,
+                               in_range=in_range, scale='ready')
+                if not payload['simulated']:
+                    print(json.dumps({'event': 'hx711_reading', 'weight_g': weight,
+                                      'measured_at': payload['measured_at']}, allow_nan=False), flush=True)
+            except UnstableScaleError as exc:
+                payload.update(error=str(exc), measurement_state='unstable', scale='ready',
+                               weight_g=None, stable=False, in_range=False)
+            except Exception as exc:
+                payload.update(error=str(exc), weight_g=None, stable=False, in_range=False)
+                code = 503
+            payload.update(camera=camera.result(), camera_error=_camera_error)
+        self._send_json(code, payload)
 
     def do_POST(self):
         if self.path not in ('/capture', '/weight'):
@@ -129,8 +223,9 @@ class PiRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError('Expected a JSON object')
             if self.path == '/weight':
-                if body.get('action') != 'tare':
-                    raise ValueError('action must be tare')
+                if body.get('action') not in ('tare', 'calibration_zero', 'calibration_load',
+                                               'calibration_finish', 'calibration_cancel'):
+                    raise ValueError('Unknown scale action')
             elif not isinstance(body.get('preview', False), bool):
                 raise ValueError('preview must be a boolean')
             elif body.get('view') not in ('A', 'B'):
@@ -139,7 +234,7 @@ class PiRequestHandler(BaseHTTPRequestHandler):
             return self._send_json(400, {'error': str(exc)})
         try:
             if self.path == '/weight':
-                payload = _tare()
+                payload = _weight_action(body)
             else:
                 payload = {'image_b64': _capture_image_b64(preview=body.get('preview', False)), 'view': body['view'],
                            'preview': body.get('preview', False),
@@ -162,6 +257,7 @@ def main():
     finally:
         server.server_close()
         _camera_worker.close()
+        _scale_worker.close()
 
 
 if __name__ == '__main__':

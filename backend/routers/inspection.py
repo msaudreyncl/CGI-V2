@@ -18,7 +18,7 @@ from models.transaction import Transaction, TransactionStatus, PrintStatus, Pric
 from models.pending_transaction import PendingTransaction, PendingStatus
 from schemas.inspection import (
     InspectionOut, InspectionListItem, CapturePayload,
-    DualCapturePayload, DualInspectionOut,
+    DualCapturePayload, DualInspectionOut, AnalysisBypassOut,
 )
 from auth import get_current_user, require_role
 from services.detection import run_detection, run_detection_with_annotation
@@ -140,7 +140,7 @@ def get_inspection(
     return InspectionOut.model_validate(inspection)
 
 
-@router.post("/capture-dual", response_model=DualInspectionOut,
+@router.post("/capture-dual", response_model=DualInspectionOut | AnalysisBypassOut,
              status_code=status.HTTP_201_CREATED)
 async def capture_dual_and_analyze(
     body: DualCapturePayload,
@@ -196,6 +196,19 @@ async def capture_dual_and_analyze(
             with open(save_path, "wb") as f:
                 f.write(img_bytes)
             created_files.append(save_path)
+
+        # Temporary capture-only workflow: no synthetic counts, grade or pricing.
+        # Do not hide inference errors when a model file is present.
+        if settings.YOLO_ALLOW_MISSING_MODEL and not os.path.exists(settings.YOLO_MODEL_PATH):
+            pending.status = PendingStatus.captured
+            db.commit()
+            return AnalysisBypassOut(
+                message="Analysis skipped — trained YOLOv8 model unavailable. No grade or price was generated.",
+                pending_id=pending.id, txn_number=pending.txn_number,
+                created_at=pending.created_at, sample_weight_g=weight_g,
+                image_path=f"static/uploads/{uid}_a.jpg",
+                image_path_b=f"static/uploads/{uid}_b.jpg",
+            )
 
         # 3. Run YOLOv8 with annotation on both images
         det_a, ann_bytes_a = run_detection_with_annotation(path_a_raw)

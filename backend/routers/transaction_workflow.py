@@ -10,12 +10,13 @@ Endpoints:
     GET  /api/transaction/{pid}           — fetch current pending row state
 """
 
+import logging
 import random
 import string
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from config import get_settings
@@ -60,7 +61,8 @@ class TransactionInitRequest(BaseModel):
 
 
 class WeightUpdateRequest(BaseModel):
-    weight_g: float
+    weight_g: float = Field(allow_inf_nan=False)
+    measured_at: datetime | None = None
 
 
 class TransactionInitResponse(BaseModel):
@@ -124,7 +126,7 @@ def update_weight(
     if not pending:
         raise HTTPException(status_code=404, detail="Pending transaction not found.")
 
-    if not (settings.WEIGHT_MIN_G <= body.weight_g <= settings.WEIGHT_MAX_G):
+    if not settings.WEIGHT_TEST_MODE and not (settings.WEIGHT_MIN_G <= body.weight_g <= settings.WEIGHT_MAX_G):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
@@ -133,10 +135,24 @@ def update_weight(
             ),
         )
 
+    logging.getLogger(__name__).warning(
+        "HX711 weight received pending_id=%s txn_number=%s weight_g=%r measured_at=%s",
+        pending.id, pending.txn_number, body.weight_g,
+        body.measured_at.isoformat() if body.measured_at else None,
+    )
+    # Respect the existing DECIMAL(7,2) capacity; never clamp an over-capacity value.
+    if abs(body.weight_g) > 99999.99:
+        raise HTTPException(status_code=422, detail="Reading exceeds existing weight storage capacity (99999.99 g).")
     pending.weight_g = body.weight_g
     pending.status   = PendingStatus.weighed
     db.commit()
     db.refresh(pending)
+    logging.getLogger(__name__).warning(
+        "HX711 weight recorded pending_id=%s txn_number=%s weight_g=%r measured_at=%s recorded_at=%s test_mode=%s",
+        pending.id, pending.txn_number, body.weight_g,
+        body.measured_at.isoformat() if body.measured_at else None,
+        datetime.now(timezone.utc).isoformat(), settings.WEIGHT_TEST_MODE,
+    )
     return PendingTransactionOut.model_validate(pending)
 
 

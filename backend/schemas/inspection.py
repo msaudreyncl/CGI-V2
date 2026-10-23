@@ -76,3 +76,18 @@ class DualInspectionOut(InspectionOut):
     total_price:       float
     currency:          str
     price_source:      str
+
+
+class AnalysisBypassOut(BaseModel):
+    analysis_skipped: bool = True
+    message: str
+    pending_id: int
+    txn_id: None = None
+    txn_number: str
+    created_at: datetime
+    sample_weight_g: float
+    image_path: str
+    image_path_b: str
+    grade: None = None
+    total_beans_detected: None = None
+    defect_results: list = []

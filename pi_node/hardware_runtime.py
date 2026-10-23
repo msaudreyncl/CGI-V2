@@ -145,3 +145,109 @@ class CameraWorker:
         except Exception:
             self.close()
             raise
+
+
+def _scale_worker(conn):
+    """Keep the HX711 initialized across reads and tare; one GPIO owner."""
+    from hx711_reader import (_load_config, _build_hx711, read_weight_g,
+                              collect_reference, filtered_sample, tare, UnstableScaleError)
+    try:
+        import RPi.GPIO as GPIO
+        if multiprocessing.current_process().name != 'MainProcess':
+            import signal
+            def stop_worker(signum, frame):
+                raise SystemExit(0)
+            signal.signal(signal.SIGTERM, stop_worker)
+        hx = _build_hx711(_load_config())
+        while True:
+            operation = conn.recv()
+            if operation == 'close':
+                break
+            try:
+                cfg = _load_config()  # Reload persisted zero/factor without resetting ADC.
+                if operation == 'weight':
+                    result = read_weight_g(hx, cfg)
+                elif operation == 'probe':
+                    result = filtered_sample(hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE'))
+                elif operation == 'reference':
+                    result = collect_reference(hx, cfg)
+                elif operation == 'tare':
+                    result = tare(hx)
+                else:
+                    raise ValueError('Unknown scale operation')
+                conn.send((True, result, None))
+            except UnstableScaleError as exc:
+                conn.send((False, str(exc), 'unstable'))
+            except ValueError as exc:
+                conn.send((False, str(exc), 'calibration'))
+    except (EOFError, BrokenPipeError, KeyboardInterrupt):
+        pass
+    except Exception as exc:
+        try:
+            conn.send((False, str(exc), 'sensor'))
+        except (BrokenPipeError, EOFError):
+            pass
+    finally:
+        if 'GPIO' in locals():
+            GPIO.cleanup()
+        conn.close()
+
+
+class ScaleWorker:
+    """Serialized by the server scale lock; recreate only after faults/pin changes."""
+    def __init__(self):
+        self.process = None
+        self.conn = None
+        self.pins = None
+
+    def close(self):
+        if self.process is not None:
+            if self.process.is_alive() and self.conn is not None:
+                try:
+                    self.conn.send('close')
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+                # Let the owner reset its GPIO before resorting to termination.
+                self.process.join(timeout=.5)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=1)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join()
+            self.process = None
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+    def request(self, operation, timeout=None):
+        from hx711_reader import _load_config, UnstableScaleError
+        cfg = _load_config()
+        pins = (cfg.getint('load_cell', 'HX711_DT_PIN'), cfg.getint('load_cell', 'HX711_SCK_PIN'))
+        if self.process is None or not self.process.is_alive() or self.pins != pins:
+            self.close()
+            ctx = multiprocessing.get_context('spawn')
+            self.conn, child = ctx.Pipe()
+            self.process = ctx.Process(target=_scale_worker, args=(child,), daemon=True)
+            self.process.start()
+            child.close()
+            self.pins = pins
+        timeout = timeout if timeout is not None else {'weight': 8, 'probe': 8, 'reference': 20, 'tare': 25}[operation]
+        try:
+            self.conn.send(operation)
+            if not self.conn.poll(timeout):
+                raise TimeoutError('HX711 timed out; check wiring, power and GPIO timing')
+            ok, result, kind = self.conn.recv()
+            if not ok:
+                if kind == 'unstable':
+                    raise UnstableScaleError(result)
+                if kind == 'calibration':
+                    raise ValueError(result)
+                raise RuntimeError(result)
+            return result
+        except (UnstableScaleError, ValueError):
+            # Keep the same ADC reference and allow settling or calibration retry.
+            raise
+        except Exception:
+            self.close()
+            raise

@@ -26,15 +26,16 @@ from tests.test_integration import client, admin_token, officer_token, farmer_id
 def config():
     cfg = configparser.ConfigParser()
     cfg.read_dict({'hardware': {'MODE': 'simulation'}, 'load_cell': {
-        'CALIBRATION_FACTOR': '-100', 'ZERO_OFFSET': '10000', 'READINGS_TO_AVERAGE': '10'}})
+        'CALIBRATION_FACTOR': '-100', 'ZERO_OFFSET': '10000', 'READINGS_TO_AVERAGE': '10',
+        'CALIBRATION_VERIFIED': 'true', 'HX711_DT_PIN': '5', 'HX711_SCK_PIN': '6'}})
     return cfg
 
 
 def test_pinned_driver_raw_conversion_and_invalid_data():
     hx = Mock()
-    hx.get_raw_data.return_value = [-25000] * 10
+    hx._read.return_value = -25000
     assert hx711_reader.read_weight_g(hx, config()) == 350
-    hx.get_raw_data.return_value = [False] * 10
+    hx._read.return_value = False
     with pytest.raises(RuntimeError):
         hx711_reader.read_weight_g(hx, config())
     cfg = config()
@@ -46,7 +47,7 @@ def test_pinned_driver_raw_conversion_and_invalid_data():
 def test_hardware_mode_never_silently_simulates(monkeypatch):
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
     assert hardware_runtime.simulated(config()) is False
-    monkeypatch.setattr(pi_server, 'run_hardware', Mock(side_effect=RuntimeError('Disconnected')))
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(side_effect=RuntimeError('Disconnected')))
     with pytest.raises(RuntimeError, match='Disconnected'):
         pi_server._read_weight()
     assert pi_server._last_weight is None
@@ -69,6 +70,8 @@ def pi_http(monkeypatch):
     pi_server._last_weight = None
     worker = hardware_runtime.CameraWorker()
     monkeypatch.setattr(pi_server, '_camera_worker', worker)
+    scale_worker = hardware_runtime.ScaleWorker()
+    monkeypatch.setattr(pi_server, '_scale_worker', scale_worker)
     server = pi_server.ThreadingHTTPServer(('127.0.0.1', 0), pi_server.PiRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -80,6 +83,7 @@ def pi_http(monkeypatch):
     server.server_close()
     thread.join()
     worker.close()
+    scale_worker.close()
 
 
 def test_hardware_to_saved_dual_transaction(client, officer_token, farmer_id, pi_http, monkeypatch, tmp_path):
@@ -135,7 +139,7 @@ def test_hardware_to_saved_dual_transaction(client, officer_token, farmer_id, pi
 def test_disconnections_and_recovery(client, officer_token, pi_http, monkeypatch):
     headers = _auth_header(officer_token)
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
-    monkeypatch.setattr(pi_server, 'run_hardware', Mock(side_effect=TimeoutError('Device disconnected')))
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(side_effect=TimeoutError('Device disconnected')))
     monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(side_effect=TimeoutError('Camera disconnected')))
     pi_server._camera_checked_at = 0
     status = client.get('/api/hardware/status', headers=headers).json()
@@ -150,20 +154,17 @@ def test_disconnections_and_recovery(client, officer_token, pi_http, monkeypatch
     assert client.get('/api/hardware/weight', headers=headers).status_code == 200
 
 
-def test_tare_persists_zero_and_clears_stability(monkeypatch, tmp_path):
+def test_server_tare_uses_same_worker_and_clears_stability(monkeypatch, tmp_path):
     cfg = config()
     target = tmp_path / 'config.ini'
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
     monkeypatch.setattr(hx711_reader, 'CONFIG_PATH', str(target))
     monkeypatch.setattr(pi_server, '_load_config', lambda: cfg)
-    monkeypatch.setattr(pi_server, 'run_hardware', Mock(return_value=12345.5))
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(return_value=12345.5))
     pi_server._last_weight = 350
     assert pi_server._tare()['tared']
     assert pi_server._last_weight is None
-    saved = configparser.ConfigParser()
-    saved.read(target)
-    assert saved.getfloat('load_cell', 'ZERO_OFFSET') == 12345.5
-    assert saved.getfloat('load_cell', 'CALIBRATION_FACTOR') == -100
+    pi_server._scale_worker.request.assert_called_once_with('tare')
 
 
 def test_picamera_autofocus_capture_and_cleanup(monkeypatch):
@@ -276,7 +277,7 @@ def test_readiness_reports_transport_and_outdated_service_errors(client, officer
 
 def test_camera_readiness_is_independent_of_failed_scale(client, officer_token, pi_http, monkeypatch):
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
-    monkeypatch.setattr(pi_server, 'run_hardware', Mock(side_effect=RuntimeError('HX711 disconnected')))
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(side_effect=RuntimeError('HX711 disconnected')))
     monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(return_value=b'jpeg'))
     pi_server._camera_checked_at = 0
     response = client.get('/api/hardware/status', headers=_auth_header(officer_token))
@@ -285,3 +286,270 @@ def test_camera_readiness_is_independent_of_failed_scale(client, officer_token, 
     assert response.json()['scale'] == 'error'
     assert 'camera' not in response.json()['details']
     assert response.json()['details']['scale'] == 'HX711 disconnected'
+
+
+def test_signed_filtered_weight_and_unstable_state_reach_frontend_api(client, officer_token, pi_http, monkeypatch):
+    from hx711_reader import UnstableScaleError
+    monkeypatch.setattr(pi_server, '_load_config', config)
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(return_value=b'frame'))
+    readings = Mock(side_effect=[0.0, 100.25, -100.25, UnstableScaleError('Scale moving; wait'), 350.0, 350.0])
+    monkeypatch.setattr(pi_server._scale_worker, 'request', readings)
+    headers = _auth_header(officer_token)
+    for expected in [0.0, 100.25, -100.25]:
+        response = client.get('/api/hardware/weight', headers=headers)
+        assert response.status_code == 200
+        assert response.json()['weight_g'] == expected
+    unstable = client.get('/api/hardware/weight', headers=headers)
+    assert unstable.status_code == 200
+    assert unstable.json()['weight_g'] is None
+    assert unstable.json()['measurement_state'] == 'unstable'
+    assert unstable.json()['stable'] is False and unstable.json()['in_range'] is False
+    assert client.get('/api/hardware/weight', headers=headers).json()['stable'] is False
+    recovered = client.get('/api/hardware/weight', headers=headers).json()
+    assert recovered['weight_g'] == 350 and recovered['stable'] and recovered['in_range']
+
+
+def test_raw_samples_to_tare_api_and_saved_transaction(client, officer_token, farmer_id, pi_http, monkeypatch, tmp_path):
+    """Use the real filter/offset math behind the actual Pi HTTP/backend routes."""
+    from models.pending_transaction import PendingTransaction
+    cfg = config()
+    cfg.set('load_cell', 'CALIBRATION_FACTOR', '1000')
+    monkeypatch.setattr(hx711_reader, 'CONFIG_PATH', str(tmp_path / 'config.ini'))
+    hx711_reader.save_scale_config(cfg)
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(return_value=b'frame'))
+    hx = Mock()
+    hx._read.side_effect = ([10000]*10 + [110000]*10 + [110000]*40 + [110000]*10
+                           + [460000]*20 + [110000]*10 + [10000]*10
+                           + [110000+i*100 for i in range(10)])
+    def request(operation):
+        if operation == 'tare':
+            return hx711_reader.tare(hx)
+        return hx711_reader.read_weight_g(hx, hx711_reader._load_config())
+    monkeypatch.setattr(pi_server._scale_worker, 'request', request)
+    headers = _auth_header(officer_token)
+    def weight():
+        resp = client.get('/api/hardware/weight', headers=headers)
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+    assert weight()['weight_g'] == 0
+    assert weight()['weight_g'] == 100
+    assert client.post('/api/hardware/weight', headers=headers, json={'action':'tare'}).status_code == 200
+    assert weight()['weight_g'] == 0
+    assert weight()['stable'] is False
+    loaded = weight()
+    assert loaded['weight_g'] == 350 and loaded['stable'] and loaded['in_range']
+    initialized = client.post('/api/transaction/init', headers=headers, json={'farmer_id':farmer_id})
+    assert initialized.status_code == 201
+    pending_id = initialized.json()['pending_id']
+    saved = client.put(f'/api/transaction/{pending_id}/weight', headers=headers, json={'weight_g':loaded['weight_g']})
+    assert saved.status_code == 200
+    with _TestSession() as db:
+        assert float(db.get(PendingTransaction,pending_id).weight_g) == 350
+    assert weight()['weight_g'] == 0
+    assert weight()['weight_g'] == -100
+    noisy = weight()
+    assert noisy['weight_g'] is None and noisy['measurement_state'] == 'unstable'
+    assert not noisy['stable'] and not noisy['in_range']
+
+@pytest.mark.parametrize('factor', [1000, -1000])
+def test_website_weight_actions_through_http_and_raw_hx711(client, officer_token, pi_http,
+                                                          monkeypatch, tmp_path, factor):
+    """Real authenticated API and Pi HTTP; only ADC counts/camera are substituted."""
+    from collections import deque
+    path = tmp_path / 'scale.ini'
+    cfg = config()
+    cfg.remove_option('load_cell', 'CALIBRATION_VERIFIED')
+    cfg.set('camera' if cfg.has_section('camera') else 'hardware', 'TEST_KEEP', 'preserved')
+    monkeypatch.setattr(hx711_reader, 'CONFIG_PATH', str(path))
+    hx711_reader.save_scale_config(cfg)
+    before = path.read_bytes()
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server, '_calibration', None)
+    monkeypatch.setattr(pi_server, '_camera_readiness', lambda: 'ready')
+    class ADC:
+        raw = 10000
+        def _read(self, **kwargs): return self.raw
+    adc = ADC()
+    def request(operation):
+        cfg = hx711_reader._load_config()
+        if operation == 'reference': return hx711_reader.collect_reference(adc, cfg)
+        if operation == 'probe': return hx711_reader.filtered_sample(adc)
+        if operation == 'tare': return hx711_reader.tare(adc)
+        return hx711_reader.read_weight_g(adc, cfg)
+    monkeypatch.setattr(pi_server._scale_worker, 'request', request)
+    headers = _auth_header(officer_token)
+    def post(action, **extra):
+        return client.post('/api/hardware/weight', headers=headers, json={'action':action, **extra})
+    # Missing calibration must allow entering Weight, but cannot validate a sample.
+    data = client.get('/api/hardware/weight', headers=headers).json()
+    assert data['scale'] == 'ready' and data['weight_g'] is None and not data['in_range']
+    zero = post('calibration_zero')
+    assert zero.status_code == 200, zero.text
+    token = zero.json()['token']
+    assert post('calibration_finish', token=token).status_code == 503
+    assert post('calibration_load', token='wrong', known_g=350).status_code == 503
+    assert post('calibration_load', token=token, known_g=0).status_code == 422
+    assert path.read_bytes() == before
+    adc.raw = 10000 + factor * 350
+    loaded = post('calibration_load', token=token, known_g=350)
+    assert loaded.status_code == 200, loaded.text
+    assert path.read_bytes() == before
+    # Loaded platform is not a valid zero return; failed verification saves nothing.
+    assert post('calibration_finish', token=token).status_code == 503
+    assert path.read_bytes() == before
+    adc.raw = 10000
+    assert post('calibration_finish', token=token).json()['calibrated']
+    saved = hx711_reader._load_config()  # Reopened from disk after calibration.
+    assert saved.getfloat('load_cell', 'CALIBRATION_FACTOR') == factor
+    assert saved.getfloat('load_cell', 'ZERO_OFFSET') == 10000
+    assert saved.get('hardware', 'TEST_KEEP') == 'preserved'
+    adc.raw = 10000 + factor * 100  # empty tray
+    assert post('tare').json()['tared']
+    for mass in (0, 339, 340, 350, 360, 361, -100):
+        adc.raw = 10000 + factor * (100 + mass)
+        client.get('/api/hardware/weight', headers=headers)
+        data = client.get('/api/hardware/weight', headers=headers).json()
+        assert data['weight_g'] == mass and data['stable']
+        assert data['in_range'] == (340 <= mass <= 360)
+    # Cancellation and expiry leave persisted settings intact.
+    before = path.read_bytes()
+    token = post('calibration_zero').json()['token']
+    assert post('tare').status_code == 503
+    assert post('calibration_cancel', token=token).json()['cancelled']
+    token = post('calibration_zero').json()['token']
+    pi_server._calibration['expires'] = 0
+    assert post('calibration_load', token=token, known_g=350).status_code == 503
+    assert path.read_bytes() == before
+
+
+def test_browser_calibration_through_authenticated_api_and_pi_http(client, officer_token,
+                                                                  pi_http, monkeypatch, tmp_path):
+    """Chromium runs the actual Step 2 JS; raw ADC counts replace physical loads."""
+    import json
+    import re
+    playwright = pytest.importorskip('playwright.sync_api')
+    root = Path(__file__).resolve().parents[2]
+    target = tmp_path / 'scale.ini'
+    cfg = config()
+    cfg.remove_option('load_cell', 'CALIBRATION_VERIFIED')
+    monkeypatch.setattr(hx711_reader, 'CONFIG_PATH', str(target))
+    hx711_reader.save_scale_config(cfg)
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server, '_calibration', None)
+    monkeypatch.setattr(pi_server, '_camera_readiness', lambda: 'ready')
+    class ADC:
+        raw = 10000
+        def _read(self, **kwargs): return self.raw
+    adc = ADC()
+    def request(operation):
+        cfg = hx711_reader._load_config()
+        if operation == 'reference': return hx711_reader.collect_reference(adc, cfg)
+        if operation == 'probe': return hx711_reader.filtered_sample(adc)
+        if operation == 'tare': return hx711_reader.tare(adc)
+        return hx711_reader.read_weight_g(adc, cfg)
+    monkeypatch.setattr(pi_server._scale_worker, 'request', request)
+    html = re.sub(r'<\?.*?\?>', '', (root/'frontend/dashboard.php').read_text(), flags=re.S)
+    html = re.sub(r'<script\b[^>]*>.*?</script>', '', html, flags=re.S)
+    actions = []
+    with playwright.sync_playwright() as pw:
+        browser = pw.chromium.launch(executable_path='/usr/bin/chromium', headless=True,
+                                     args=['--no-sandbox'])
+        try:
+            page = browser.new_page(viewport={'width':800, 'height':480})
+            errors = []
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            def route_request(route):
+                from urllib.parse import urlsplit
+                path = urlsplit(route.request.url).path
+                if path == '/':
+                    return route.fulfill(body=html, content_type='text/html')
+                if path.startswith('/api/hardware/'):
+                    if route.request.method == 'POST':
+                        body = route.request.post_data_json
+                        actions.append(body['action'])
+                        response = client.post(path, json=body, headers=_auth_header(officer_token))
+                    else:
+                        response = client.get(path, headers=_auth_header(officer_token))
+                    return route.fulfill(status=response.status_code, body=response.text,
+                                         content_type='application/json')
+                if path == '/api/users/1/farmer':
+                    return route.fulfill(json={'id':7, 'user_id':1})
+                if path.endswith('/init'):
+                    return route.fulfill(json={'pending_id':42, 'txn_number':'SCALE-TEST'})
+                return route.abort()
+            page.route('**/*', route_request)
+            page.goto('http://cgi.test/')
+            page.evaluate('''() => {
+              for(let i=1;i<=6;i++){const e=document.createElement('span');e.id='step-badge-'+i;document.body.appendChild(e);}
+              window.bootstrap={Modal:class {constructor(el){this.el=el} show(){} hide(){}}};
+              window.CGI_API={get:path=>fetch(path),post:(path,body)=>fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})};
+              document.getElementById('farmer-select').innerHTML='<option value="1">Test Farmer</option>';
+            }''')
+            page.add_script_tag(content=(root/'frontend/assets/js/dashboard.js').read_text())
+            def click(id): page.locator('#'+id).evaluate('(e)=>e.click()')
+            click('btn-start-txn')
+            page.locator('.prep-check').evaluate_all('(els)=>els.forEach(e=>{e.checked=true;e.dispatchEvent(new Event("change"))})')
+            page.wait_for_function("!document.getElementById('btn-to-weight').disabled")
+            click('btn-to-weight')
+            page.wait_for_function("!document.getElementById('stage-2').classList.contains('d-none')")
+            def dialog_response(dialog):
+                if dialog.type == 'prompt':
+                    dialog.accept('350')
+                else:
+                    if dialog.message.startswith('Place ONLY'): adc.raw = 360000
+                    if dialog.message.startswith('Remove the reference mass'): adc.raw = 10000
+                    dialog.accept()
+            page.on('dialog', dialog_response)
+            click('btn-calibrate-scale')
+            page.wait_for_function("!document.getElementById('btn-calibrate-scale').disabled")
+            page.wait_for_function("document.getElementById('live-weight-value').textContent === '0.00 g'")
+            assert actions == ['calibration_zero', 'calibration_load', 'calibration_finish']
+            assert hx711_reader._load_config().getfloat('load_cell', 'CALIBRATION_FACTOR') == 1000
+            adc.raw = 110000  # empty 100 g tray
+            click('btn-tare-scale')
+            page.wait_for_function("!document.getElementById('btn-tare-scale').disabled")
+            assert hx711_reader._load_config().getfloat('load_cell', 'ZERO_OFFSET') == 110000
+            adc.raw = 460000  # tray + 350 g sample
+            page.wait_for_function("document.getElementById('live-weight-value').textContent === '350.00 g' && !document.getElementById('btn-to-capture').disabled")
+            adc.raw = 471000  # tray + 361 g, rejected
+            page.wait_for_function("document.getElementById('live-weight-value').textContent === '361.00 g' && document.getElementById('btn-to-capture').disabled")
+            assert not errors, errors
+        finally:
+            browser.close()
+
+
+def test_acquisition_negative_unstable_http_to_transaction(
+        client, officer_token, farmer_id, pi_http, monkeypatch, caplog):
+    from routers import transaction_workflow, hardware
+    from models.pending_transaction import PendingTransaction
+    cfg = config()
+    cfg.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
+    cfg.set('load_cell', 'CALIBRATION_VERIFIED', 'false')
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server, '_load_config', lambda: cfg)
+    monkeypatch.setattr(pi_server, '_camera_readiness', lambda: 'ready')
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(return_value=-123.456789))
+    monkeypatch.setattr(hardware.settings, 'WEIGHT_TEST_MODE', True)
+    monkeypatch.setattr(transaction_workflow.settings, 'WEIGHT_TEST_MODE', True)
+    headers = _auth_header(officer_token)
+    reading = client.get('/api/hardware/weight', headers=headers).json()
+    assert reading['weight_g'] == -123.456789
+    assert reading['weight_test_mode'] and not reading['simulated']
+    assert not reading['stable'] and not reading['in_range']
+    assert reading['measured_at']
+    pending_id = client.post('/api/transaction/init', headers=headers,
+                             json={'farmer_id': farmer_id}).json()['pending_id']
+    saved = client.put(f'/api/transaction/{pending_id}/weight', headers=headers,
+                       json={'weight_g': reading['weight_g'], 'measured_at': reading['measured_at']})
+    assert saved.status_code == 200, saved.text
+    with _TestSession() as db:
+        assert float(db.get(PendingTransaction, pending_id).weight_g) == -123.46
+    assert '-123.456789' in caplog.text and reading['measured_at'] in caplog.text
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(side_effect=RuntimeError('Disconnected')))
+    assert client.get('/api/hardware/weight', headers=headers).status_code == 503
+    assert client.get('/api/hardware/status', headers=headers).json()['scale'] == 'error'
+    monkeypatch.setattr(transaction_workflow.settings, 'WEIGHT_TEST_MODE', False)
+    assert client.put(f'/api/transaction/{pending_id}/weight', headers=headers,
+                      json={'weight_g': -123.456789}).status_code == 422

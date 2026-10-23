@@ -137,6 +137,7 @@
         let weightSaving = false;
         let tareBusy = false;
         let weightReadAt = 0;
+        let weightMeasuredAt = null;
         let acceptedA = false, acceptedB = false;
         let captureStage = false;
         let captureBusy = false;
@@ -461,8 +462,24 @@
         document.querySelectorAll('.prep-check').forEach(cb => cb.addEventListener('change', _validateStage1));
         document.getElementById('btn-recheck-hw').addEventListener('click', _checkHardware);
         
+        async function _resolveFarmerProfile(userId) {
+            const path = '/api/users/' + userId + '/farmer';
+            let resp = await API.get(path);
+            if (resp.status === 404) {
+                // Registration creates a user account; create its optional profile
+                // through the existing endpoint when starting its first transaction.
+                resp = await API.post(path, { user_id: userId });
+                if (resp.status === 409) resp = await API.get(path);
+            }
+            const profile = await resp.json();
+            if (!resp.ok) throw new Error(profile.detail || 'Could not load the farmer profile.');
+            if (!Number.isInteger(profile.id) || profile.id <= 0 || profile.user_id !== userId)
+                throw new Error('Invalid farmer profile returned. Refresh the page and try again.');
+            return profile.id;
+        }
+
         document.getElementById('btn-to-weight').addEventListener('click', async () => {
-            const farmerId  = document.getElementById('farmer-select').value;
+            const farmerUserId = Number(document.getElementById('farmer-select').value);
             const farmerOpt = document.querySelector('#farmer-select option:checked');
             farmerName = farmerOpt ? farmerOpt.textContent.trim() : '';
         
@@ -484,7 +501,8 @@
         
             // Production: call the real init endpoint
             try {
-                const resp = await API.post('/api/transaction/init', { farmer_id: parseInt(farmerId) });
+                const farmerId = await _resolveFarmerProfile(farmerUserId);
+                const resp = await API.post('/api/transaction/init', { farmer_id: farmerId });
                 if (!resp.ok) {
                     const err = await resp.json();
                     _showError('stage1-error', err.detail || 'Failed to initialize transaction.');
@@ -499,7 +517,7 @@
                 document.getElementById('txn-number-badge').classList.remove('d-none');
                 document.getElementById('txn-modal-label').textContent = 'Transaction: ' + txnNumber;
             } catch (e) {
-                _showError('stage1-error', 'Network error: ' + e.message);
+                _showError('stage1-error', 'Unable to start transaction: ' + e.message);
                 document.getElementById('btn-to-weight').disabled = false;
                 return;
             }
@@ -514,7 +532,7 @@
             _stopWeightPoll();
             currentWeight = null;
             document.getElementById('btn-to-capture').disabled = true;
-            weightPollTimer = setInterval(_pollWeight, 500);
+            weightPollTimer = setInterval(_pollWeight, 12.5);
             _pollWeight();
         }
         
@@ -531,7 +549,7 @@
             const generation = weightPollGeneration;
             weightRequestBusy = true;
             try {
-                let w, stable, inRange;
+                let w, stable, inRange, testMode = false;
         
                 if (devMode) {
                     // Simulate weight ramping to a stable 350 g
@@ -539,40 +557,51 @@
                 } else {
                     try {
                         const resp = await API.get('/api/hardware/weight');
-                        if (!resp.ok) throw new Error('Scale unavailable');
                         const data = await resp.json();
+                        if (!resp.ok) throw new Error(data.detail || data.error || 'Scale unavailable');
                         if (generation !== weightPollGeneration) return;
+                        if (data.measurement_state === 'unstable')
+                            throw new Error(data.error || 'Scale moving — wait for settling');
                         w = Number(data.weight_g);
                         if (data.weight_g == null || !Number.isFinite(w)) throw new Error('Invalid weight');
+                        hwScale = 'ready';
+                        _updateHwCard('scale', 'ready');
+                        testMode = data.weight_test_mode === true && data.simulated === false;
+                        weightMeasuredAt = data.measured_at || null;
                         stable  = data.stable;
                         inRange = data.in_range;
                     } catch (e) {
                         if (generation !== weightPollGeneration) return;
+                        hwScale = 'error';
+                        _updateHwCard('scale', 'error', e.message);
                         currentWeight = null;
                         document.getElementById('btn-to-capture').disabled = true;
                         document.getElementById('live-weight-value').textContent = '— g';
                         document.getElementById('weight-status-badge').innerHTML =
-                            '<span class="badge bg-secondary">Scale unreachable</span>';
+                            '<span class="badge bg-secondary"></span>';
+                        document.querySelector('#weight-status-badge span').textContent = e.message;
                         return;
                     }
                 }
         
-                document.getElementById('live-weight-value').textContent = w.toFixed(1) + ' g';
+                document.getElementById('live-weight-value').textContent = w.toFixed(2) + ' g';
         
                 let badgeHtml = '';
-                if (w < 340) {
+                if (testMode) {
+                    badgeHtml = '<span class="badge bg-warning text-dark fs-6">Live sensor — calibration bypassed</span>';
+                } else if (!stable) {
+                    badgeHtml = '<span class="badge bg-warning text-dark fs-6">Stabilizing…</span>';
+                } else if (w < 340) {
                     badgeHtml = '<span class="badge bg-danger fs-6">Insufficient — add beans</span>';
                 } else if (w > 360) {
                     badgeHtml = '<span class="badge bg-danger fs-6">Excess — remove beans</span>';
-                } else if (!stable) {
-                    badgeHtml = '<span class="badge bg-warning text-dark fs-6">Stabilizing…</span>';
                 } else {
                     badgeHtml = '<span class="badge bg-success fs-6">✓ Valid — proceed</span>' +
                                 (devMode ? ' <span class="badge bg-warning text-dark">Simulated</span>' : '');
                 }
                 document.getElementById('weight-status-badge').innerHTML = badgeHtml;
 
-                const canProceed = inRange && stable && Number.isFinite(w) && w >= 340 && w <= 360;
+                const canProceed = Number.isFinite(w) && (testMode || (inRange && stable && w >= 340 && w <= 360));
                 document.getElementById('btn-to-capture').disabled = !canProceed;
                 currentWeight = canProceed ? w : null;
                 weightReadAt = Date.now();
@@ -586,8 +615,11 @@
             tareBusy = true;
             _stopWeightPoll();
             currentWeight = null;
+            document.getElementById('live-weight-value').textContent = '— g';
+            document.getElementById('weight-status-badge').textContent = 'Taring — keep the scale still…';
             document.getElementById('btn-to-capture').disabled = true;
             document.getElementById('btn-tare-scale').disabled = true;
+            document.getElementById('btn-calibrate-scale').disabled = true;
             _hideError('stage2-error');
             try {
                 if (devMode) DEV.resetWeight();
@@ -603,10 +635,60 @@
             } finally {
                 tareBusy = false;
                 document.getElementById('btn-tare-scale').disabled = false;
+                document.getElementById('btn-calibrate-scale').disabled = false;
                 if (document.getElementById('stage-2').classList.contains('d-none') === false) _startWeightPoll();
             }
         });
         
+        document.getElementById('btn-calibrate-scale').addEventListener('click', async () => {
+            if (tareBusy || weightSaving) return;
+            if (devMode) {
+                _showError('stage2-error', 'Calibration requires real HX711 hardware. Turn off Development Mode.');
+                return;
+            }
+            if (!window.confirm('Remove all removable loads, including the tray. Leave the fixed platform, let it settle, then press OK to measure zero.')) return;
+            tareBusy = true;
+            _stopWeightPoll();
+            currentWeight = null;
+            document.getElementById('btn-to-capture').disabled = true;
+            document.getElementById('live-weight-value').textContent = '— g';
+            for (const id of ['btn-tare-scale', 'btn-calibrate-scale', 'btn-back-to-prepare'])
+                document.getElementById(id).disabled = true;
+            _hideError('stage2-error');
+            let token = null;
+            async function action(name, extra = {}) {
+                document.getElementById('weight-status-badge').textContent = 'Calibrating — keep the scale still…';
+                const resp = await API.post('/api/hardware/weight', {action: name, token, ...extra});
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.detail || data.error || 'Calibration failed');
+                return data;
+            }
+            try {
+                token = (await action('calibration_zero')).token;
+                const entered = window.prompt('Enter the accurately known reference mass in grams (prefer near 350 g).');
+                if (entered === null) return;
+                const known = Number(entered);
+                if (!Number.isFinite(known) || known <= 0) throw new Error('Reference mass must be a positive number in grams.');
+                if (!window.confirm('Place ONLY the known ' + known + ' g reference on the platform. Let it settle, then press OK.')) return;
+                await action('calibration_load', {known_g: known});
+                if (!window.confirm('Remove the reference mass. Leave the bare fixed platform, let it settle, then press OK to verify zero and save.')) return;
+                await action('calibration_finish');
+                token = null;
+                window.alert('Calibration saved. Verify an independent known mass, then place the empty tray and tare before adding beans.');
+            } catch (e) {
+                _showError('stage2-error', e.message);
+            } finally {
+                if (token) {
+                    try { await action('calibration_cancel'); }
+                    catch (e) { _showError('stage2-error', 'Calibration session could not be cancelled: ' + e.message + '. It expires after 10 minutes.'); }
+                }
+                tareBusy = false;
+                for (const id of ['btn-tare-scale', 'btn-calibrate-scale', 'btn-back-to-prepare'])
+                    document.getElementById(id).disabled = false;
+                if (!document.getElementById('stage-2').classList.contains('d-none')) _startWeightPoll();
+            }
+        });
+
         document.getElementById('btn-back-to-prepare').addEventListener('click', () => {
             _stopWeightPoll();
             _setStage(1);
@@ -631,7 +713,7 @@
             // Production: persist weight to pending row
             try {
                 const resp = await API.put('/api/transaction/' + pendingId + '/weight',
-                                           { weight_g: currentWeight });
+                                           { weight_g: currentWeight, measured_at: weightMeasuredAt });
                 if (!resp.ok) {
                     const err = await resp.json();
                     _showError('stage2-error', err.detail || 'Failed to save weight.');
@@ -943,8 +1025,8 @@
                 (parseFloat(data.sample_weight_g)/1000).toFixed(3) + ' kg)';
         
             const gradeBadge = document.getElementById('res-grade-badge');
-            gradeBadge.textContent = _gradeLabel(data.grade);
-            gradeBadge.className   = 'badge fs-5 px-3 py-2 bg-' + _gradeClass(data.grade);
+            gradeBadge.textContent = data.analysis_skipped ? 'Analysis skipped — model unavailable' : _gradeLabel(data.grade);
+            gradeBadge.className   = 'badge fs-5 px-3 py-2 bg-' + (data.analysis_skipped ? 'warning text-dark' : _gradeClass(data.grade));
             document.getElementById('res-threshold-badge')
                 .classList.toggle('d-none', !data.over_threshold_flag);
         
@@ -1003,6 +1085,13 @@
                 _setImg('res-img-b-ann', 'res-img-b-ann-link', data.image_path_annotated_b);
             }
         
+            if (data.analysis_skipped) {
+                for (const id of ['res-market-rate', 'res-multiplier', 'res-price-per-kg', 'res-total-price'])
+                    document.getElementById(id).textContent = 'Unavailable';
+                document.getElementById('res-price-source').textContent = data.message;
+                return;
+            }
+
             document.getElementById('res-market-rate').textContent  = _phpFormat(data.market_rate_per_kg) + '/kg';
             document.getElementById('res-multiplier').textContent   = 'x' + parseFloat(data.multiplier).toFixed(4);
             document.getElementById('res-price-per-kg').textContent = _phpFormat(data.price_per_kg) + '/kg';
@@ -1025,7 +1114,7 @@
         function _buildReceiptPreview() {
             const d = currentAnalysis;
             if (!d) return;
-            const gradeLabel = _gradeLabel(d.grade);
+            const gradeLabel = d.analysis_skipped ? 'SKIPPED — MODEL UNAVAILABLE' : _gradeLabel(d.grade);
             const date       = (d.created_at || '').replace('T', ' ').slice(0, 16);
             const weightKg   = (parseFloat(d.sample_weight_g) / 1000).toFixed(3);
             const lines = [
@@ -1040,9 +1129,9 @@
                 _pad32('Grade   : ', gradeLabel),
                 d.over_threshold_flag ? '! OVER THRESHOLD - LOW VALUE !' : '',
                 _pad32('Weight  : ', weightKg + ' kg'),
-                _pad32('Price/kg: ', _phpFormat(d.price_per_kg)),
+                _pad32('Price/kg: ', d.analysis_skipped ? 'Unavailable' : _phpFormat(d.price_per_kg)),
                 '─'.repeat(36),
-                _pad32('TOTAL   : ', _phpFormat(d.total_price)),
+                _pad32('TOTAL   : ', d.analysis_skipped ? 'Unavailable — test only' : _phpFormat(d.total_price)),
                 '─'.repeat(36),
                 devMode ? '     [DEV] Simulated — no printer required' : '         Thank you!',
                 '       CGI System v1.0',
@@ -1067,6 +1156,11 @@
                 return;
             }
         
+            if (currentAnalysis?.analysis_skipped) {
+                _showError('stage6-error', 'Analysis was skipped. No finalized transaction or printable graded receipt was created.');
+                btn.disabled = false;
+                return;
+            }
             if (!txnId) { btn.disabled = false; return; }
             statusEl.innerHTML = '<span class="badge bg-secondary">Sending to printer…</span>';
         
@@ -1103,6 +1197,7 @@
                 return;
             }
         
+            if (currentAnalysis?.analysis_skipped) { txnModal.hide(); return; }
             if (!txnId) { btn.disabled = false; return; }
         
             try {

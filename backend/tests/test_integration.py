@@ -494,3 +494,25 @@ class TestReports:
         assert "grade_distribution" in data
         assert "total_inspections_today" in data
         assert set(data["grade_distribution"].keys()) == {"extra_class", "class_i", "class_ii"}
+
+
+def test_prepare_resolves_farmer_account_to_profile(client, admin_token, officer_token):
+    headers = _auth_header(officer_token)
+    registered = client.post('/api/auth/register', headers=_auth_header(admin_token), json={
+        'name': 'Prepare Farmer', 'email': 'prepare-farmer@test.local',
+        'password': 'Farmer@1234', 'role': 'farmer'})
+    assert registered.status_code == 201, registered.text
+    user_id = registered.json()['id']
+    accounts = client.get('/api/users/farmers', headers=headers).json()
+    assert any(account['id'] == user_id for account in accounts)
+    assert client.get(f'/api/users/{user_id}/farmer', headers=headers).status_code == 404
+    created = client.post(f'/api/users/{user_id}/farmer', headers=headers, json={'user_id': user_id})
+    assert created.status_code == 201, created.text
+    profile = client.get(f'/api/users/{user_id}/farmer', headers=headers).json()
+    assert profile['user_id'] == user_id
+    assert profile['id'] != user_id  # Regression: account and profile IDs are independent.
+    initialized = client.post('/api/transaction/init', headers=headers, json={'farmer_id': profile['id']})
+    assert initialized.status_code == 201, initialized.text
+    pending = client.get('/api/transaction/' + str(initialized.json()['pending_id']), headers=headers).json()
+    assert pending['farmer_id'] == profile['id']
+    assert client.post(f'/api/users/{user_id}/farmer', headers=headers, json={'user_id': user_id}).status_code == 409

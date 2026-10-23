@@ -25,6 +25,8 @@ LENS_POSITION =
 AUTOFOCUS_WAIT = 1.5
 
 [load_cell]
+# Temporary acquisition testing only; bypass accuracy/stability checks.
+WEIGHT_TEST_MODE = false
 # GPIO data pin connected to HX711 DT
 HX711_DT_PIN  = 5
 # GPIO clock pin connected to HX711 SCK
@@ -32,6 +34,10 @@ HX711_SCK_PIN = 6
 # Calibration factor (run hx711_reader.py --calibrate to find this value).
 # May be negative — sign depends on load cell wiring orientation.
 CALIBRATION_FACTOR = 1.0
+# Set by the verification wizard, never by guessing a factor/sign.
+CALIBRATION_VERIFIED = false
+# Maximum accepted spread within a batch/reference (grams).
+MAX_SPREAD_G = 0.5
 # Persisted by --tare / --calibrate and the transaction Tare button.
 ZERO_OFFSET = 0
 # Samples collected per weight reading (more = slower but smoother).
