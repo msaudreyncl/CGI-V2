@@ -84,9 +84,9 @@ def _tare():
     with _scale_lock:
         cfg = _load_config()
         if not simulated(cfg):
-            offset = run_hardware('tare')
-            cfg.set('load_cell', 'ZERO_OFFSET', str(offset))
-            save_scale_config(cfg)
+            # tare() inside the child process saves the new ZERO_OFFSET to
+            # config.ini atomically; no second write is needed here.
+            run_hardware('tare')
         _last_weight = None
     return {'tared': True, 'simulated': simulated(cfg)}
 

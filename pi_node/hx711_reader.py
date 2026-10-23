@@ -10,7 +10,6 @@ Usage:
 import argparse
 import configparser
 import os
-import sys
 import time
 import math
 import statistics
@@ -25,6 +24,9 @@ except (ImportError, RuntimeError):
     _ON_PI = False
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.ini")
+
+# ADC full-scale sentinel values reported by hx711==1.1.2.3 on open-circuit/wiring errors.
+_HX711_SENTINELS = frozenset((-8388608, 8388607))
 
 
 def _load_config() -> configparser.ConfigParser:
@@ -47,19 +49,59 @@ def _build_hx711(cfg: configparser.ConfigParser):
     return hx
 
 
-def raw_mean(hx, readings=10):
-    # hx711==1.1.2.3 exposes raw samples, not tare/get_current_weight.
-    values = hx.get_raw_data(times=readings)
-    if not values or len(values) != readings or any(
-        isinstance(v, bool) or not math.isfinite(v) or v in (-8388608, 8388607)
-        for v in values
-    ):
-        raise RuntimeError("Invalid HX711 readings; check wiring")
-    return statistics.mean(values)
+def _stable_raw(hx, readings: int, outlier_iqr_mult: float = 1.5) -> float:
+    """Return a stable, outlier-filtered mean of `readings` HX711 ADC samples.
+
+    Strategy:
+      1. Collect `readings + 4` samples to have surplus after filtering.
+      2. Discard ADC sentinel values (open-circuit / over-range markers).
+      3. Remove statistical outliers using the IQR fence method.
+      4. Require at least `readings` clean samples; retry once if not.
+      5. Return the mean of the trimmed set.
+
+    Raises RuntimeError if valid samples cannot be obtained after one retry.
+    """
+    def _collect_and_filter():
+        raw = hx.get_raw_data(times=readings + 4)
+        # Reject sentinels and non-finite values
+        clean = [
+            v for v in raw
+            if not isinstance(v, bool)
+            and math.isfinite(float(v))
+            and v not in _HX711_SENTINELS
+        ]
+        if len(clean) < readings:
+            return None
+        # IQR outlier rejection — skip if all values are identical (iqr == 0)
+        q1, _, q3 = statistics.quantiles(clean, n=4)
+        iqr = q3 - q1
+        if iqr > 0:
+            fence = outlier_iqr_mult * iqr
+            clean = [v for v in clean if q1 - fence <= v <= q3 + fence]
+        if len(clean) < readings:
+            return None
+        return statistics.mean(clean[:readings])
+
+    result = _collect_and_filter()
+    if result is None:
+        # One retry — give the ADC a moment to settle after a noisy batch
+        time.sleep(0.15)
+        result = _collect_and_filter()
+    if result is None:
+        raise RuntimeError(
+            "HX711 returned too few valid readings after filtering. "
+            "Check wiring, power supply, and GPIO pin numbers in config.ini."
+        )
+    return result
 
 
-def save_scale_config(cfg):
-    # Atomic replacement avoids partially written calibration after power loss.
+def raw_mean(hx, readings: int = 10) -> float:
+    """Backward-compatible alias for _stable_raw used by hardware_runtime._worker."""
+    return _stable_raw(hx, readings)
+
+
+def save_scale_config(cfg: configparser.ConfigParser) -> None:
+    """Atomically replace config.ini to avoid partial writes on power loss."""
     fd, path = tempfile.mkstemp(dir=os.path.dirname(CONFIG_PATH), prefix='.scale-')
     try:
         with os.fdopen(fd, 'w') as stream:
@@ -70,20 +112,33 @@ def save_scale_config(cfg):
             os.unlink(path)
 
 
-def tare(hx, readings=10):
+def tare(hx, readings: int = 20) -> float:
+    """Zero the scale.
+
+    Takes `readings` samples (default 20 for a stable baseline), saves the
+    raw ADC offset to config.ini, and returns the offset value.
+
+    Must be called with the platform in its tared state (e.g. empty tray in
+    place but no beans). Never tare with the sample load present.
+    """
     cfg = _load_config()
-    offset = raw_mean(hx, readings)
+    offset = _stable_raw(hx, readings)
     cfg.set('load_cell', 'ZERO_OFFSET', str(offset))
     save_scale_config(cfg)
     return offset
 
 
-def read_weight_g(hx, cfg):
+def read_weight_g(hx, cfg: configparser.ConfigParser) -> float:
+    """Convert a filtered raw ADC reading to grams using calibration parameters."""
     factor = cfg.getfloat('load_cell', 'CALIBRATION_FACTOR')
     if not math.isfinite(factor) or factor == 0:
-        raise ValueError('CALIBRATION_FACTOR must be finite and nonzero')
-    offset = cfg.getfloat('load_cell', 'ZERO_OFFSET', fallback=0)
-    weight = (raw_mean(hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE')) - offset) / factor
+        raise ValueError(
+            'CALIBRATION_FACTOR is 0 or invalid — run the calibration wizard: '
+            'python hx711_reader.py --calibrate'
+        )
+    offset = cfg.getfloat('load_cell', 'ZERO_OFFSET', fallback=0.0)
+    n = cfg.getint('load_cell', 'READINGS_TO_AVERAGE', fallback=10)
+    weight = (_stable_raw(hx, n) - offset) / factor
     if not math.isfinite(weight):
         raise ValueError('Invalid scale calibration or reading')
     return weight
@@ -97,39 +152,80 @@ def is_weight_in_range(weight_g: float, cfg: configparser.ConfigParser) -> bool:
 
 
 def main():
-    from hardware_runtime import run_hardware, simulated
-    parser = argparse.ArgumentParser(description="HX711 reader (grams)")
-    parser.add_argument('--tare', action='store_true')
-    parser.add_argument('--calibrate', action='store_true')
+    parser = argparse.ArgumentParser(description="HX711 load cell reader (grams)")
+    parser.add_argument('--tare',      action='store_true', help='Zero the scale and save offset')
+    parser.add_argument('--calibrate', action='store_true', help='Interactive calibration wizard')
     args = parser.parse_args()
+
     cfg = _load_config()
-    if simulated(cfg):
-        if args.tare or args.calibrate:
-            parser.error('Calibration/tare requires hardware mode on a Raspberry Pi')
-        print('[SIMULATION] 350.0 g')
-        return
-    if args.tare or args.calibrate:
-        input('Remove all weight, leave the empty tray, then press ENTER: ')
-        offset = run_hardware('tare')
-        if args.calibrate:
-            known = float(input('Known calibration mass in grams: '))
-            if not math.isfinite(known) or known <= 0:
-                raise ValueError('Known mass must be positive and finite')
-            input('Place the known mass, then press ENTER: ')
-            factor = (run_hardware('raw') - offset) / known
-            if not math.isfinite(factor) or factor == 0:
-                raise ValueError('No load response; check wiring')
-            cfg.set('load_cell', 'CALIBRATION_FACTOR', str(factor))
-        cfg.set('load_cell', 'ZERO_OFFSET', str(offset))
-        save_scale_config(cfg)
-        print('Saved calibration/zero to config.ini')
-        return
+
+    # Simulation guard
     try:
-        while True:
-            print(f"{run_hardware('weight'):.2f} g")
-            time.sleep(0.5)
-    except KeyboardInterrupt:
+        from hardware_runtime import simulated
+        if simulated(cfg):
+            if args.tare or args.calibrate:
+                parser.error('Calibration/tare requires hardware mode on a Raspberry Pi')
+            print('[SIMULATION] 350.0 g')
+            return
+    except ImportError:
         pass
+
+    if not _ON_PI:
+        parser.error(
+            'RPi.GPIO / hx711 library not available — run this on a Raspberry Pi '
+            'with the venv activated (source venv/bin/activate).'
+        )
+
+    import RPi.GPIO as GPIO
+    try:
+        hx = _build_hx711(cfg)
+
+        if args.tare or args.calibrate:
+            input('\nRemove all weight from the scale, leave only the empty tray, '
+                  'then press ENTER: ')
+            print('Measuring tare offset (20 samples)…', end=' ', flush=True)
+            offset = tare(hx, readings=20)
+            print(f'done.  Offset = {offset:.1f}')
+
+            if args.calibrate:
+                known_str = input('\nEnter the exact mass of your calibration weight in grams: ')
+                known = float(known_str.strip())
+                if not math.isfinite(known) or known <= 0:
+                    raise ValueError('Calibration mass must be a positive finite number')
+                input(f'\nPlace the {known:.1f} g calibration weight on the scale, '
+                      'then press ENTER: ')
+                print('Measuring calibration raw (20 samples)…', end=' ', flush=True)
+                raw_with_load = _stable_raw(hx, readings=20)
+                print(f'done.  Raw with load = {raw_with_load:.1f}')
+
+                factor = (raw_with_load - offset) / known
+                if not math.isfinite(factor) or factor == 0:
+                    raise ValueError(
+                        'Calibration factor is zero — the scale did not respond to the load. '
+                        'Check wiring and ensure the load cell is properly mounted.'
+                    )
+                cfg.set('load_cell', 'CALIBRATION_FACTOR', str(factor))
+                cfg.set('load_cell', 'ZERO_OFFSET', str(offset))
+                save_scale_config(cfg)
+                print(f'\nCalibration saved to config.ini:')
+                print(f'  CALIBRATION_FACTOR = {factor:.6f}')
+                print(f'  ZERO_OFFSET        = {offset:.1f}')
+                print('\nVerify by running:  python hx711_reader.py')
+            else:
+                print('Tare offset saved to config.ini.')
+            return
+
+        # Continuous weight display
+        print('Reading weight — press Ctrl+C to stop.\n')
+        try:
+            while True:
+                weight = read_weight_g(hx, cfg)
+                print(f'\r  {weight:+8.2f} g   ', end='', flush=True)
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print('\nStopped.')
+    finally:
+        GPIO.cleanup()
 
 
 if __name__ == '__main__':
