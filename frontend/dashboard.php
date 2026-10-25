@@ -608,7 +608,7 @@ if ($role !== 'farmer') {
 <?php api_inject_jwt_script(); ?>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="<?= APP_BASE ?>/assets/js/navbar.js?v=3"></script>
-<script src="<?= APP_BASE ?>/assets/js/dashboard.js?v=9"
+<script src="<?= APP_BASE ?>/assets/js/dashboard.js?v=10"
         data-app-base="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>"
         data-api-base=""></script>
 <script src="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>/assets/js/api.js"></script>

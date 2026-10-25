@@ -19,6 +19,7 @@ from datetime import date, datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from routers.hardware import _pi_get
 from services.scale_measurement import measurement_status, sensor_testing_status
@@ -27,8 +28,9 @@ from database import get_db
 from models.user import User, UserRole
 from models.farmer import Farmer
 from models.pending_transaction import PendingTransaction, PendingStatus
+from models.inspection import Inspection
 from schemas.pending_transaction import PendingTransactionOut
-from auth import require_role
+from auth import require_role, get_current_user
 
 router   = APIRouter(prefix="/api/transaction", tags=["transaction-workflow"])
 settings = get_settings()
@@ -187,6 +189,103 @@ async def update_weight(
         body.measured_at.isoformat() if body.measured_at else None,
         datetime.now(timezone.utc).isoformat(), settings.WEIGHT_TEST_MODE,
     )
+    return PendingTransactionOut.model_validate(pending)
+
+
+class SimulationCompletion(BaseModel):
+    farmer_id: int
+    txn_number: str = Field(pattern=r"^DEV-\d{8}-[A-Z0-9]{6}$")
+    result: dict
+
+
+def _metadata(pending):
+    try:
+        value = json.loads(pending.weight_metadata or '{}')
+        return value if isinstance(value, dict) else {'original_weight_metadata': value}
+    except (ValueError, TypeError):
+        return {'original_weight_metadata': pending.weight_metadata}
+
+
+@router.get("/completed-tests", response_model=list[PendingTransactionOut])
+def completed_tests(
+    skip: int = 0, limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Completed non-sale runs, read from existing pending records only."""
+    query = db.query(PendingTransaction).filter(PendingTransaction.status == PendingStatus.completed)
+    # Normal sales remain on /api/transactions; never return a second copy here.
+    query = query.filter(~db.query(Inspection.id).filter(
+        Inspection.txn_number == PendingTransaction.txn_number).exists())
+    if current_user.role == UserRole.farmer:
+        if not current_user.farmer_profile:
+            return []
+        query = query.filter(PendingTransaction.farmer_id == current_user.farmer_profile.id)
+    rows = query.order_by(PendingTransaction.created_at.desc(), PendingTransaction.id.desc()).offset(
+        max(0, skip)).limit(min(max(1, limit), 100)).all()
+    return [PendingTransactionOut.model_validate(row) for row in rows]
+
+
+@router.post("/complete-simulation", response_model=PendingTransactionOut)
+def complete_simulation(
+    body: SimulationCompletion,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.admin, UserRole.officer)),
+):
+    """Archive the existing browser simulation explicitly as simulated, never as a sale."""
+    if not db.get(Farmer, body.farmer_id):
+        raise HTTPException(status_code=404, detail="Farmer not found.")
+    existing = db.query(PendingTransaction).filter(PendingTransaction.txn_number == body.txn_number).first()
+    if existing:
+        if existing.officer_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Access denied.")
+        return PendingTransactionOut.model_validate(existing)
+    try:
+        metadata = json.dumps({'simulated': True, 'simulation_result': body.result,
+                               'completed_at': datetime.now(timezone.utc).isoformat()}, allow_nan=False)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Simulation contains invalid numeric values.")
+    pending = PendingTransaction(txn_number=body.txn_number, farmer_id=body.farmer_id,
+        officer_id=current_user.id, weight_g=None, weight_metadata=metadata, status=PendingStatus.completed)
+    db.add(pending)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        pending = db.query(PendingTransaction).filter(PendingTransaction.txn_number == body.txn_number).first()
+        if not pending:
+            raise
+        if pending.officer_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Access denied.")
+    db.refresh(pending)
+    return PendingTransactionOut.model_validate(pending)
+
+
+@router.put("/{pending_id}/complete-test", response_model=PendingTransactionOut)
+def complete_test(
+    pending_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role(UserRole.admin, UserRole.officer)),
+):
+    """Idempotently finish an already captured/analyzed test; no measurement or inference."""
+    pending = db.query(PendingTransaction).filter(PendingTransaction.id == pending_id).with_for_update().first()
+    if not pending:
+        raise HTTPException(status_code=404, detail="Pending transaction not found.")
+    if current_user.role != UserRole.admin and pending.officer_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied.")
+    if pending.status == PendingStatus.completed:
+        return PendingTransactionOut.model_validate(pending)
+    # A normal sale must continue through the existing transaction completion path.
+    if db.query(Inspection.id).filter(Inspection.txn_number == pending.txn_number).first():
+        raise HTTPException(status_code=409, detail="Use the existing sale completion endpoint.")
+    if pending.status not in (PendingStatus.captured, PendingStatus.analyzed):
+        raise HTTPException(status_code=409, detail="Capture or analysis must finish before completion.")
+    metadata = _metadata(pending)
+    metadata['completed_at'] = datetime.now(timezone.utc).isoformat()
+    pending.weight_metadata = json.dumps(metadata, allow_nan=False)
+    pending.status = PendingStatus.completed
+    db.commit()
+    db.refresh(pending)
     return PendingTransactionOut.model_validate(pending)
 
 

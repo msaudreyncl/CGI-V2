@@ -85,7 +85,20 @@ document.addEventListener("DOMContentLoaded", () => {
         }).format(new Date(`${dateString}T00:00:00`));
     }
 
+    function formatNumber(value, decimals = 0, suffix = "") {
+        return value == null ? "Not recorded" : Number(value).toLocaleString("en-PH", {
+            minimumFractionDigits: decimals, maximumFractionDigits: decimals
+        }) + suffix;
+    }
+
+    function sensorReading(transaction) {
+        const reading = transaction.sensorReading;
+        if (reading?.value == null) return "Not recorded";
+        return `${reading.value} ${reading.unit || "Unit not recorded"} (${reading.calibrated ? "calibrated" : "uncalibrated"})`;
+    }
+
     function formatMoney(value, currency) {
+        if (value == null) return "Not recorded";
         return new Intl.NumberFormat("en-PH", {
             style: "currency", currency,
             minimumFractionDigits: 2,
@@ -105,6 +118,11 @@ document.addEventListener("DOMContentLoaded", () => {
         activeTransaction = transaction;
 
         document.getElementById("details-title").textContent = transaction.id;
+        document.getElementById("details-record-label").textContent = transaction.recordLabel;
+        document.getElementById("details-sensor-reading").textContent = sensorReading(transaction);
+        document.getElementById("details-sensor-time").textContent = transaction.sensorReading?.measured_at ?? "Not recorded";
+        document.getElementById("details-raw-counts").textContent = transaction.sensorReading?.raw_counts == null
+            ? "Not recorded" : String(transaction.sensorReading.raw_counts);
         document.getElementById("details-datetime").textContent = `${formatDate(transaction.date)} · ${transaction.time}`;
 
         const grade = document.getElementById("details-grade");
@@ -113,12 +131,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
         document.getElementById("details-confidence").textContent = transaction.confidence == null ? "Not recorded" : `${Number(transaction.confidence).toFixed(1)}%`;
         document.getElementById("details-coffee").textContent = transaction.coffee;
-        document.getElementById("details-weight").textContent = `${Number(transaction.weight).toFixed(2)} g`;
-        document.getElementById("details-beans").textContent = transaction.beans.toLocaleString();
+        document.getElementById("details-weight").textContent = formatNumber(transaction.weight, 2, " g");
+        document.getElementById("details-beans").textContent = formatNumber(transaction.beans);
         document.getElementById("details-defects").textContent = transaction.defects == null ? "Not recorded" : transaction.defects.toLocaleString();
         document.getElementById("details-percentage").textContent = transaction.defectPercentage == null ? "Not recorded" : `${Number(transaction.defectPercentage).toFixed(3)}% defects`;
-        document.getElementById("details-reference").textContent = `${formatMoney(transaction.referencePrice, transaction.currency)}/kg`;
-        document.getElementById("details-recorded-weight").textContent = `${Number(transaction.pricingWeightKg).toFixed(4)} kg`;
+        document.getElementById("details-reference").textContent = transaction.referencePrice == null ? "Not recorded" : `${formatMoney(transaction.referencePrice, transaction.currency)}/kg`;
+        document.getElementById("details-recorded-weight").textContent = formatNumber(transaction.pricingWeightKg, 4, " kg");
         document.getElementById("details-threshold").hidden = !transaction.overThreshold;
         document.getElementById("details-price").textContent = formatMoney(transaction.suggestedPrice, transaction.currency);
 
@@ -211,6 +229,7 @@ document.addEventListener("DOMContentLoaded", () => {
             <div class="receipt-brand">
                 <h3>COFFEE GRADE<br>IDENTIFICATION</h3>
                 <p>Quality Assessment Receipt</p>
+                <p>${escapeHTML(transaction.recordLabel)}</p>
             </div>
 
             <div class="receipt-rule"></div>
@@ -240,17 +259,19 @@ document.addEventListener("DOMContentLoaded", () => {
             </div>
             <div class="receipt-row">
                 <span>Weight</span>
-                <strong>${Number(transaction.weight).toFixed(2)} g</strong>
+                <strong>${formatNumber(transaction.weight, 2, " g")}</strong>
             </div>
-            <div class="receipt-row"><span>Detected beans</span><strong>${Number(transaction.beans).toLocaleString()}</strong></div>
+            <div class="receipt-row"><span>Saved HX711 reading</span><strong>${escapeHTML(sensorReading(transaction))}</strong></div>
+            <div class="receipt-row"><span>Raw HX711 ADC counts</span><strong>${escapeHTML(transaction.sensorReading?.raw_counts ?? "Not recorded")}</strong></div>
+            <div class="receipt-row"><span>Detected beans</span><strong>${formatNumber(transaction.beans)}</strong></div>
             <div class="receipt-row"><span>Detected defects</span><strong>${transaction.defects == null ? 'Not recorded' : Number(transaction.defects)}</strong></div>
             <div class="receipt-row"><span>Defects (%)</span><strong>${transaction.defectPercentage == null ? 'Not recorded' : Number(transaction.defectPercentage).toFixed(3) + '%'}</strong></div>
             <div class="receipt-row">
-                <span>Transaction weight</span><strong>${Number(transaction.pricingWeightKg).toFixed(4)} kg</strong>
+                <span>Transaction weight</span><strong>${formatNumber(transaction.pricingWeightKg, 4, " kg")}</strong>
             </div>
             <div class="receipt-row">
                 <span>Reference price</span>
-                <strong>${escapeHTML(formatMoney(transaction.referencePrice, transaction.currency))} / kg</strong>
+                <strong>${escapeHTML(formatMoney(transaction.referencePrice, transaction.currency))}${transaction.referencePrice == null ? "" : " / kg"}</strong>
             </div>
 
             <div class="receipt-rule"></div>
@@ -301,6 +322,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const headers = [
             "Transaction ID",
+            "Record Type",
+            "HX711 Value",
+            "HX711 Unit",
+            "HX711 Calibrated",
+            "HX711 Raw ADC Counts",
+            "HX711 Measured At",
             "Date",
             "Time",
             "Coffee Type",
@@ -319,6 +346,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const csvRows = visibleTransactions.map((transaction) => [
             transaction.id,
+            transaction.recordLabel,
+            transaction.sensorReading?.value,
+            transaction.sensorReading?.unit,
+            transaction.sensorReading?.calibrated,
+            transaction.sensorReading?.raw_counts,
+            transaction.sensorReading?.measured_at,
             transaction.date,
             transaction.time,
             transaction.coffee,
@@ -352,7 +385,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function csvValue(value) {
         const raw = String(value ?? "");
-        const string = /^[=+@\-\t\r]/.test(raw) ? "\'" + raw : raw;
+        const string = typeof value === "string" && /^[=+@\-\t\r]/.test(raw) ? "\'" + raw : raw;
         return `"${string.replaceAll('"', '""')}"`;
     }
 

@@ -1271,13 +1271,29 @@
             btn.disabled = true;
             _hideError('stage6-error');
         
-            if (devMode) {
-                // In dev mode no DB record was created — just close the modal
-                txnModal.hide();
+            if (devMode || currentAnalysis?.analysis_skipped || currentAnalysis?.sensor_test_mode) {
+                try {
+                    let resp;
+                    if (devMode) {
+                        const farmerId = await _resolveFarmerProfile(Number(document.getElementById('farmer-select').value));
+                        resp = await API.post('/api/transaction/complete-simulation', {
+                            farmer_id: farmerId, txn_number: txnNumber, result: currentAnalysis
+                        });
+                    } else {
+                        resp = await API.put('/api/transaction/' + pendingId + '/complete-test', {});
+                    }
+                    if (!resp.ok) {
+                        const err = await resp.json();
+                        throw new Error(err.detail || 'Failed to save completed test.');
+                    }
+                    txnModal.hide();
+                    location.reload();
+                } catch (e) {
+                    _showError('stage6-error', 'Completion was not saved: ' + e.message + ' Please retry.');
+                    btn.disabled = false;
+                }
                 return;
             }
-        
-            if (currentAnalysis?.analysis_skipped || currentAnalysis?.sensor_test_mode) { txnModal.hide(); return; }
             if (!txnId) { btn.disabled = false; return; }
         
             try {

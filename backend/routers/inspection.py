@@ -210,6 +210,12 @@ async def capture_dual_and_analyze(
         # Temporary capture-only workflow: no synthetic counts, grade or pricing.
         # Do not hide inference errors when a model file is present.
         if settings.YOLO_ALLOW_MISSING_MODEL and not os.path.exists(settings.YOLO_MODEL_PATH):
+            weight_metadata['capture_result'] = {
+                'analysis_skipped': True,
+                'image_path': f"static/uploads/{uid}_a.jpg",
+                'image_path_b': f"static/uploads/{uid}_b.jpg",
+            }
+            pending.weight_metadata = json.dumps(weight_metadata, allow_nan=False)
             pending.status = PendingStatus.captured
             db.commit()
             return AnalysisBypassOut(

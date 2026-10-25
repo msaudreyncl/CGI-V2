@@ -36,6 +36,9 @@ for ($skip = 0; ; $skip += 100) {
         $hasBreakdown = count($breakdown) > 0;
         $transactions[] = [
             'id' => $inspection['txn_number'] ?: '#' . $saved['id'],
+            'recordLabel' => 'Assessment',
+            'sensorReading' => null,
+            'sortDate' => $saved['created_at'],
             'date' => history_datetime($saved['created_at'], 'Y-m-d'),
             'time' => history_datetime($saved['created_at'], 'h:i A'),
             'coffee' => 'Not recorded', // Existing schema has no coffee-type field.
@@ -58,6 +61,60 @@ for ($skip = 0; ; $skip += 100) {
     }
     if (count($batch) < 100) break;
 }
+// Test runs have no sale row: read their existing pending-record archive.
+if (!$historyError) {
+    for ($skip = 0; ; $skip += 100) {
+        $response = api_request('GET', "/api/transaction/completed-tests?skip={$skip}&limit=100");
+        if ($response['status'] !== 200 || !is_array($response['data']) || !array_is_list($response['data'])) {
+            $historyError = true;
+            break;
+        }
+        $batch = api_response_list($response);
+        foreach ($batch as $saved) {
+            $metadata = json_decode($saved['weight_metadata'] ?? '{}', true);
+            $metadata = is_array($metadata) ? $metadata : [];
+            $simulated = ($metadata['simulated'] ?? false) === true;
+            $analysis = $simulated ? ($metadata['simulation_result'] ?? []) : ($metadata['sensor_analysis'] ?? []);
+            $analysis = is_array($analysis) ? $analysis : [];
+            $breakdown = $analysis['defect_results'] ?? [];
+            $hasBreakdown = count($breakdown) > 0;
+            $id = $saved['txn_number'];
+            if (isset($seenTransactions['test:' . $id])) continue;
+            $seenTransactions['test:' . $id] = true;
+            $grade = $analysis['grade'] ?? null;
+            $created = $metadata['completed_at'] ?? $saved['created_at'];
+            $transactions[] = [
+                'id' => $id,
+                'recordLabel' => $simulated ? 'Simulated development run' : 'Test run — no sale',
+                'sensorReading' => $simulated ? null : ($metadata['sensor_reading'] ?? null),
+                'sortDate' => $created,
+                'date' => history_datetime($created, 'Y-m-d'),
+                'time' => history_datetime($created, 'h:i A'),
+                'coffee' => 'Not recorded',
+                // Only persisted grams or explicitly simulated grams belong in this field.
+                'weight' => $simulated ? ($analysis['sample_weight_g'] ?? null) : $saved['weight_g'],
+                'pricingWeightKg' => null,
+                'currency' => $analysis['currency'] ?? null,
+                'overThreshold' => $analysis['over_threshold_flag'] ?? false,
+                'beans' => $analysis['total_beans_detected'] ?? null,
+                'defects' => $hasBreakdown ? array_sum(array_column($breakdown, 'bean_count')) : null,
+                'defectPercentage' => $hasBreakdown ? array_sum(array_column($breakdown, 'defect_percentage')) : null,
+                'grade' => ['extra_class' => 'Extra Class', 'class_i' => 'Class I', 'class_ii' => 'Class II'][$grade] ?? 'Not recorded',
+                'confidence' => null,
+                'referencePrice' => $simulated ? ($analysis['price_per_kg'] ?? null) : null,
+                'suggestedPrice' => $simulated ? ($analysis['total_price'] ?? null) : null,
+                'defectList' => array_map(fn($d) => [
+                    'name' => ucwords(str_replace('_', ' ', $d['defect_type'])),
+                    'count' => $d['bean_count'], 'percentage' => $d['defect_percentage'],
+                ], $breakdown),
+            ];
+        }
+        if (count($batch) < 100) break;
+    }
+}
+usort($transactions, fn($a, $b) => ((new DateTime($b['sortDate'], new DateTimeZone('UTC')))->getTimestamp()
+    <=> (new DateTime($a['sortDate'], new DateTimeZone('UTC')))->getTimestamp())
+    ?: strcmp($b['id'], $a['id']));
 // Avoid presenting partial totals as a complete history when a request fails.
 if ($historyError) { $transactions = []; http_response_code(503); }
 
@@ -66,7 +123,17 @@ $extraClass = count(array_filter($transactions, fn($t) => $t["grade"] === "Extra
 $classI = count(array_filter($transactions, fn($t) => $t["grade"] === "Class I"));
 $classII = count(array_filter($transactions, fn($t) => $t["grade"] === "Class II"));
 
-function history_money($value, string $currency): string {
+function history_number($value, int $decimals = 0, string $suffix = ''): string {
+    return $value === null ? 'Not recorded' : number_format($value, $decimals) . $suffix;
+}
+
+function history_reading($reading): string {
+    if (!is_array($reading) || !isset($reading['value'])) return 'Not recorded';
+    return htmlspecialchars((string)$reading['value'] . ' ' . ($reading['unit'] ?? 'Unit not recorded'), ENT_QUOTES, 'UTF-8');
+}
+
+function history_money($value, ?string $currency): string {
+    if ($value === null) return 'Not recorded';
     return htmlspecialchars($currency === 'PHP' ? '₱' : $currency . ' ', ENT_QUOTES, 'UTF-8') . number_format($value, 2);
 }
 
@@ -170,6 +237,7 @@ function gradeClass($grade)
                         <option value="Extra Class">Extra Class</option>
                         <option value="Class I">Class I</option>
                         <option value="Class II">Class II</option>
+                        <option value="Not recorded">Grade not recorded</option>
                     </select>
 
                     <select id="date-filter" aria-label="Filter by date">
@@ -212,7 +280,7 @@ function gradeClass($grade)
                                         <span class="transaction-mark"></span>
                                         <div>
                                             <strong><?= htmlspecialchars($transaction["id"]) ?></strong>
-                                            <span><?= htmlspecialchars($transaction["coffee"]) ?></span>
+                                            <span><?= htmlspecialchars($transaction["coffee"]) ?> · <?= htmlspecialchars($transaction["recordLabel"]) ?></span>
                                         </div>
                                     </div>
                                 </td>
@@ -223,8 +291,9 @@ function gradeClass($grade)
                                 </td>
 
                                 <td>
-                                    <strong><?= number_format($transaction["weight"], 2) ?> g</strong>
-                                    <span class="table-sub"><?= number_format($transaction["beans"]) ?> beans</span>
+                                    <strong><?= history_number($transaction["weight"], 2, " g") ?></strong>
+                                    <span class="table-sub"><?= history_number($transaction["beans"], 0, " beans") ?></span>
+                                    <?php if ($transaction["sensorReading"] !== null): ?><span class="table-sub">Sensor: <?= history_reading($transaction["sensorReading"]) ?></span><?php endif; ?>
                                 </td>
 
                                 <td>
@@ -240,7 +309,7 @@ function gradeClass($grade)
 
                                 <td>
                                     <strong class="price-value"><?= history_money($transaction["suggestedPrice"], $transaction["currency"]) ?></strong>
-                                    <span class="table-sub"><?= history_money($transaction["referencePrice"], $transaction["currency"]) ?>/kg ref.</span>
+                                    <span class="table-sub"><?= history_money($transaction["referencePrice"], $transaction["currency"]) ?><?= $transaction["referencePrice"] === null ? "" : "/kg ref." ?></span>
                                 </td>
 
                                 <td class="print-cell">
@@ -289,6 +358,7 @@ function gradeClass($grade)
                     <span class="eyebrow">TRANSACTION DETAILS</span>
                     <h2 id="details-title">Transaction</h2>
                     <p id="details-datetime">—</p>
+                    <p id="details-record-label">—</p>
                 </div>
             </div>
 
@@ -308,6 +378,9 @@ function gradeClass($grade)
                     <div class="details-list">
                         <div><span>Coffee type</span><strong id="details-coffee">—</strong></div>
                         <div><span>Sample weight</span><strong id="details-weight">—</strong></div>
+                        <div><span>Saved HX711 reading</span><strong id="details-sensor-reading">—</strong></div>
+                        <div><span>HX711 reading timestamp</span><strong id="details-sensor-time">—</strong></div>
+                        <div><span>Raw HX711 ADC counts</span><strong id="details-raw-counts">—</strong></div>
                         <div><span>Detected beans</span><strong id="details-beans">—</strong></div>
                         <div><span>Detected defects</span><strong id="details-defects">—</strong></div>
                     </div>
@@ -350,7 +423,7 @@ function gradeClass($grade)
     <div id="receipt-print-area" aria-hidden="true"></div>
 
     <script src="assets/js/navbar.js?v=2"></script>
-    <script src="assets/js/history.js?v=5"></script>
+    <script src="assets/js/history.js?v=6"></script>
 </body>
 
 </html>
