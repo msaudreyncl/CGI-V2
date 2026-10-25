@@ -36,6 +36,7 @@ for ($skip = 0; ; $skip += 100) {
         $hasBreakdown = count($breakdown) > 0;
         $transactions[] = [
             'id' => $inspection['txn_number'] ?: '#' . $saved['id'],
+            'farmerId' => $inspection['farmer_id'] ?? null,
             'recordLabel' => 'Assessment',
             'sensorReading' => null,
             'sortDate' => $saved['created_at'],
@@ -85,6 +86,7 @@ if (!$historyError) {
             $created = $metadata['completed_at'] ?? $saved['created_at'];
             $transactions[] = [
                 'id' => $id,
+                'farmerId' => $saved['farmer_id'] ?? null,
                 'recordLabel' => $simulated ? 'Simulated development run' : 'Test run — no sale',
                 'sensorReading' => $simulated ? null : ($metadata['sensor_reading'] ?? null),
                 'sortDate' => $created,
@@ -117,6 +119,47 @@ usort($transactions, fn($a, $b) => ((new DateTime($b['sortDate'], new DateTimeZo
     ?: strcmp($b['id'], $a['id']));
 // Avoid presenting partial totals as a complete history when a request fails.
 if ($historyError) { $transactions = []; http_response_code(503); }
+
+// Resolve profile IDs through existing authorized read APIs. A farmer profile ID
+// is distinct from a user ID; never look up a user by transaction.farmer_id.
+function history_farmer_names(array $transactions, array $user): array {
+    $needed = [];
+    foreach ($transactions as $transaction) {
+        if (!empty($transaction['farmerId'])) $needed[(int)$transaction['farmerId']] = true;
+    }
+    if (!$needed) return [];
+    $role = $user['role'] ?? '';
+    if ($role === 'farmer') {
+        $candidates = [$user];
+    } else {
+        // Admins can resolve inactive accounts too; officers use their permitted list.
+        $response = api_request('GET', $role === 'admin' ? '/api/users' : '/api/users/farmers');
+        $candidates = api_response_list($response);
+    }
+    $names = [];
+    foreach ($candidates as $candidate) {
+        if (!$needed) break;
+        $userId = (int)($candidate['id'] ?? 0);
+        $name = trim((string)($candidate['name'] ?? ''));
+        if (!$userId || $name === '') continue;
+        $response = api_request('GET', "/api/users/{$userId}/farmer");
+        $profile = $response['data'] ?? null;
+        if (($response['status'] ?? 0) !== 200 || !is_array($profile)
+            || (int)($profile['user_id'] ?? 0) !== $userId) continue;
+        $profileId = (int)($profile['id'] ?? 0);
+        if (isset($needed[$profileId])) {
+            $names[$profileId] = $name;
+            unset($needed[$profileId]);
+        }
+    }
+    return $names;
+}
+
+$farmerNames = history_farmer_names($transactions, $user);
+foreach ($transactions as &$transaction) {
+    $transaction['farmerName'] = $farmerNames[(int)($transaction['farmerId'] ?? 0)] ?? 'Not Available';
+}
+unset($transaction);
 
 $totalTransactions = count($transactions);
 $extraClass = count(array_filter($transactions, fn($t) => $t["grade"] === "Extra Class"));
@@ -157,7 +200,7 @@ function gradeClass($grade)
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="assets/css/history.css?v=5">
+    <link rel="stylesheet" href="assets/css/history.css?v=6">
     <link rel="stylesheet" href="assets/css/navbar.css?v=3">
 </head>
 
@@ -255,14 +298,14 @@ function gradeClass($grade)
                 <table class="history-table">
                     <thead>
                         <tr>
-                            <th>Transaction</th>
+                            <th>Transaction ID</th>
+                            <th>Farmer Name</th>
                             <th>Date & Time</th>
                             <th>Weight</th>
                             <th>Defects</th>
                             <th>Grade</th>
                             <th>Suggested Price</th>
-                            <th class="print-heading">Receipt</th>
-                            <th class="view-heading"><span class="sr-only">View details</span></th>
+                            <th class="print-heading">Actions</th>
                         </tr>
                     </thead>
                     <tbody id="history-body">
@@ -284,6 +327,8 @@ function gradeClass($grade)
                                         </div>
                                     </div>
                                 </td>
+
+                                <td class="farmer-name-cell"><?= htmlspecialchars($transaction["farmerName"], ENT_QUOTES, "UTF-8") ?></td>
 
                                 <td>
                                     <strong class="table-date"><?= date("M d, Y", strtotime($transaction["date"])) ?></strong>
@@ -312,21 +357,20 @@ function gradeClass($grade)
                                     <span class="table-sub"><?= history_money($transaction["referencePrice"], $transaction["currency"]) ?><?= $transaction["referencePrice"] === null ? "" : "/kg ref." ?></span>
                                 </td>
 
-                                <td class="print-cell">
+                                <td class="print-cell actions-cell">
+                                    <div class="history-actions">
                                     <button type="button" class="print-btn" aria-label="Print receipt for <?= htmlspecialchars($transaction["id"]) ?>">
                                         <svg viewBox="0 0 24 24" aria-hidden="true">
                                             <path d="M6 9V3h12v6h1a3 3 0 0 1 3 3v5h-4v4H6v-4H2v-5a3 3 0 0 1 3-3h1Zm2-4v4h8V5H8Zm8 14v-5H8v5h8Zm3-4h1v-3a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v3h2v-3h12v3h1Z" />
                                         </svg>
                                         Print
                                     </button>
-                                </td>
-
-                                <td class="view-cell">
                                     <button type="button" class="view-btn" aria-label="View <?= htmlspecialchars($transaction["id"]) ?>">
                                         <svg viewBox="0 0 24 24" aria-hidden="true">
                                             <path d="m9.29 6.71 1.42-1.42L17.41 12l-6.7 6.71-1.42-1.42L14.59 12 9.29 6.71Z" />
                                         </svg>
                                     </button>
+                                    </div>
                                 </td>
                             </tr>
                         <?php endforeach; ?>
@@ -376,6 +420,7 @@ function gradeClass($grade)
                 <section class="details-section">
                     <span class="details-label">SAMPLE INFORMATION</span>
                     <div class="details-list">
+                        <div><span>Farmer Name</span><strong id="details-farmer-name">—</strong></div>
                         <div><span>Coffee type</span><strong id="details-coffee">—</strong></div>
                         <div><span>Sample weight</span><strong id="details-weight">—</strong></div>
                         <div><span>Saved HX711 reading</span><strong id="details-sensor-reading">—</strong></div>
@@ -423,7 +468,7 @@ function gradeClass($grade)
     <div id="receipt-print-area" aria-hidden="true"></div>
 
     <script src="assets/js/navbar.js?v=2"></script>
-    <script src="assets/js/history.js?v=6"></script>
+    <script src="assets/js/history.js?v=7"></script>
 </body>
 
 </html>

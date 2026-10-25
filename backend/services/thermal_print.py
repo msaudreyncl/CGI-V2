@@ -25,7 +25,7 @@ def print_receipt(txn: Transaction, db: Session) -> None:
     officer: User          = db.get(User, inspection.officer_id) if inspection else None
 
     grade_label = inspection.grade.value.replace("_", " ").title() if inspection else "N/A"
-    farmer_name = farmer_user.name if farmer_user else "N/A"
+    farmer_name = farmer_user.name.strip() if farmer_user and farmer_user.name.strip() else "Not Available"
     officer_name = officer.name if officer else "N/A"
 
     try:
@@ -48,9 +48,10 @@ def print_receipt(txn: Transaction, db: Session) -> None:
         printer.text("-" * 32 + "\n")
 
         printer.set(align="left")
-        printer.text(f"Txn No  : {inspection.txn_number or 'N/A'}\n")
-        printer.text(f"Date    : {txn.created_at.strftime('%Y-%m-%d %H:%M')}\n")
-        printer.text(f"Farmer  : {farmer_name}\n")
+        printer.text(f"Transaction ID: {inspection.txn_number or 'N/A'}\n")
+        printer.text(f"Farmer Name: {farmer_name}\n")
+        # ASCII separator retains compatibility with existing thermal code pages.
+        printer.text(f"Date & Time: {txn.created_at.strftime('%B %d, %Y - %I:%M %p')}\n")
         printer.text(f"Officer : {officer_name}\n")
         printer.text(f"Insp ID : {inspection.id}\n")
         printer.text("-" * 32 + "\n")

@@ -118,6 +118,7 @@ document.addEventListener("DOMContentLoaded", () => {
         activeTransaction = transaction;
 
         document.getElementById("details-title").textContent = transaction.id;
+        document.getElementById("details-farmer-name").textContent = transaction.farmerName || "Not Available";
         document.getElementById("details-record-label").textContent = transaction.recordLabel;
         document.getElementById("details-sensor-reading").textContent = sensorReading(transaction);
         document.getElementById("details-sensor-time").textContent = transaction.sensorReading?.measured_at ?? "Not recorded";
@@ -239,12 +240,12 @@ document.addEventListener("DOMContentLoaded", () => {
                 <strong>${escapeHTML(transaction.id)}</strong>
             </div>
             <div class="receipt-row">
-                <span>Date</span>
-                <strong>${escapeHTML(formatDate(transaction.date))}</strong>
+                <span>Farmer Name</span>
+                <strong>${escapeHTML(transaction.farmerName || "Not Available")}</strong>
             </div>
             <div class="receipt-row">
-                <span>Time</span>
-                <strong>${escapeHTML(transaction.time)}</strong>
+                <span>Date &amp; Time</span>
+                <strong>${escapeHTML(formatDate(transaction.date))} — ${escapeHTML(transaction.time)}</strong>
             </div>
 
             <div class="receipt-rule"></div>
@@ -322,6 +323,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const headers = [
             "Transaction ID",
+            "Farmer Name",
             "Record Type",
             "HX711 Value",
             "HX711 Unit",
@@ -346,6 +348,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const csvRows = visibleTransactions.map((transaction) => [
             transaction.id,
+            transaction.farmerName || "Not Available",
             transaction.recordLabel,
             transaction.sensorReading?.value,
             transaction.sensorReading?.unit,

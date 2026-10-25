@@ -1190,16 +1190,20 @@
             const d = currentAnalysis;
             if (!d) return;
             const gradeLabel = d.analysis_skipped ? 'SKIPPED — MODEL UNAVAILABLE' : _gradeLabel(d.grade);
-            const date       = (d.created_at || '').replace('T', ' ').slice(0, 16);
+            const receiptDate = d.created_at ? new Date(d.created_at) : null;
+            const date = receiptDate && !Number.isNaN(receiptDate.getTime())
+                ? receiptDate.toLocaleDateString('en-PH', { month: 'long', day: 'numeric', year: 'numeric' })
+                    + ' — ' + receiptDate.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit', hour12: true })
+                : 'Not Available';
             const weightLabel = d.sample_weight_g == null ? 'Unavailable — sensor test' : (parseFloat(d.sample_weight_g) / 1000).toFixed(3) + ' kg';
             const lines = [
                 '            CGI',
                 '  Coffee Grade Identification',
                 d.sensor_test_mode ? '  SENSOR TEST — NO SALE OR SAMPLE PRICE' : devMode ? '  *** DEVELOPMENT MODE — NOT A REAL RECORD ***' : '',
                 '─'.repeat(36),
-                _pad32('Txn No  : ', d.txn_number || txnNumber),
-                _pad32('Date    : ', date),
-                _pad32('Farmer  : ', farmerName || '—'),
+                _pad32('Transaction ID: ', d.txn_number || txnNumber),
+                _pad32('Farmer Name: ', farmerName || 'Not Available'),
+                _pad32('Date & Time: ', date),
                 '─'.repeat(36),
                 _pad32('Grade   : ', gradeLabel),
                 d.over_threshold_flag ? '! OVER THRESHOLD - LOW VALUE !' : '',

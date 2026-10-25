@@ -945,3 +945,23 @@ tr:focus-visible {
     border-radius: 8px;
     color: var(--danger);
 }
+
+/* Keep long farmer names readable within the horizontally scrollable table. */
+.history-table .farmer-name-cell {
+    min-width: 145px;
+    max-width: 200px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+}
+
+.history-actions {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.history-actions .view-btn {
+    flex-shrink: 0;
+}
