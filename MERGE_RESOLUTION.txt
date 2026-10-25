@@ -1,0 +1,49 @@
+Resolved CGI-V2 merge files
+==========================
+Only these five files are included:
+frontend/assets/js/dashboard.js
+pi_node/hx711_reader.py
+pi_node/pi_server.py
+pi_node/config.ini.example
+pi_node/test_hx711_measurement.py
+
+Decisions
+- Retain the persistent ScaleWorker and bounded HX711 acquisition.
+- Retain verified calibration, tare, reference checks, and duration-based stability.
+- Retain existing sensor-testing bypass and hardware error reporting.
+- Add incoming raw ADC diagnostics and measurement-unit metadata.
+- Raw ADC counts are never relabeled or saved as grams.
+- Do not accept the incoming unbounded get_raw_data acquisition or legacy
+  calibration acceptance, which conflict with the existing verification design.
+- Update incoming regression tests to use ScaleWorker.request and the existing
+  tuple return contract, rather than an obsolete run_hardware interface.
+- Clarify example configuration comments; do not modify actual config.ini.
+- Backend, database, migrations, and authentication files are not included or edited.
+- Automatically merged dashboard.php and hardware_runtime.py are left unchanged.
+
+Validation here
+11 GPIO-free unittest cases pass.
+Python compilation and node --check pass.
+No remaining Git conflict-marker lines in supplied code.
+PHP unavailable; backend and real hardware not supplied/available.
+Run the complete repository tests and actual scale/capture checks on the Pi.
+
+Install from repository root (after downloading archive to ~/Downloads):
+1. Back up the three current conflicted files before replacing them.
+2. tar -xzf ~/Downloads/cgi-merge-resolved.tar.gz -C /var/www/html/CGI-V2
+3. git --no-pager diff --check
+4. python3 -m unittest discover -s pi_node -p test_hx711_measurement.py -v
+5. node --check frontend/assets/js/dashboard.js
+6. php -l frontend/dashboard.php
+7. Run existing relevant backend tests in the backend virtual environment.
+8. Verify live scale readings and Capture progression with the intended testing
+   settings. The archive preserves existing mode flags; it does not turn them on.
+   Ensure backend sensor-testing configuration and Pi WEIGHT_SENSOR_TEST_MODE
+   agree. Uncalibrated live readings remain ADC counts.
+9. git add frontend/assets/js/dashboard.js pi_node/hx711_reader.py pi_node/pi_server.py pi_node/config.ini.example pi_node/test_hx711_measurement.py
+10. git status
+11. Only after validation and no unmerged paths:
+    git commit -m "merge: resolve dashboard and HX711 conflicts"
+    git push origin main
+
+Leave the existing stash untouched until separately reviewed. No force push.

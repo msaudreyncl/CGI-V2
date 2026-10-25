@@ -602,3 +602,33 @@ def test_uncalibrated_million_counts_through_authenticated_proxy(client, officer
         assert data['raw_adc'] == raw and data['raw_unit'] == 'ADC counts'
         assert data['weight_g'] is None and not data['calibrated']
         assert not data['stable'] and not data['in_range']
+
+
+@pytest.mark.parametrize('warm,deadline', [(False,20),(True,8)])
+def test_readiness_camera_cold_start_deadline(monkeypatch,warm,deadline):
+    monkeypatch.setenv('CGI_HARDWARE_MODE','hardware')
+    monkeypatch.setattr(pi_server,'_load_config',config)
+    request=Mock(return_value=b'real-frame-substitute')
+    process=Mock() if warm else None
+    if process is not None: process.is_alive.return_value=True
+    monkeypatch.setattr(pi_server,'_camera_worker',types.SimpleNamespace(process=process,request=request))
+    monkeypatch.setattr(pi_server,'_camera_checked_at',0)
+    assert pi_server._camera_readiness() == 'ready'
+    request.assert_called_once_with('preview',timeout=deadline)
+
+
+def test_weight_proxy_deadline_covers_cold_camera_start(monkeypatch):
+    import asyncio
+    import httpx
+    from routers import hardware
+    response=Mock(status_code=200)
+    response.json.return_value={'scale':'ready'}
+    connection=AsyncMock()
+    connection.get.return_value=response
+    from unittest.mock import MagicMock
+    factory=MagicMock()
+    factory.return_value.__aenter__=AsyncMock(return_value=connection)
+    factory.return_value.__aexit__=AsyncMock(return_value=False)
+    monkeypatch.setattr(httpx,'AsyncClient',factory)
+    assert asyncio.run(hardware._pi_get('/weight')) == {'scale':'ready'}
+    factory.assert_called_once_with(timeout=25.0)

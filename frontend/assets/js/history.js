@@ -59,6 +59,7 @@ document.addEventListener("DOMContentLoaded", () => {
         emptyState.hidden = !noResults;
         tableWrap.hidden = noResults;
         tableFooter.hidden = noResults;
+        exportBtn.disabled = noResults;
         resultCount.textContent = `Showing ${visible} ${visible === 1 ? "transaction" : "transactions"}`;
     }
 
@@ -84,11 +85,12 @@ document.addEventListener("DOMContentLoaded", () => {
         }).format(new Date(`${dateString}T00:00:00`));
     }
 
-    function formatPeso(value) {
-        return `₱${Number(value).toLocaleString("en-PH", {
+    function formatMoney(value, currency) {
+        return new Intl.NumberFormat("en-PH", {
+            style: "currency", currency,
             minimumFractionDigits: 2,
             maximumFractionDigits: 2
-        })}`;
+        }).format(Number(value));
     }
 
     function gradeClass(grade) {
@@ -114,10 +116,11 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById("details-weight").textContent = `${Number(transaction.weight).toFixed(2)} g`;
         document.getElementById("details-beans").textContent = transaction.beans.toLocaleString();
         document.getElementById("details-defects").textContent = transaction.defects == null ? "Not recorded" : transaction.defects.toLocaleString();
-        document.getElementById("details-points").textContent = transaction.defectPercentage == null ? "Not recorded" : `${Number(transaction.defectPercentage).toFixed(3)}% defects`;
-        document.getElementById("details-reference").textContent = `${formatPeso(transaction.referencePrice)}/kg`;
-        document.getElementById("details-recorded-weight").textContent = `${Number(transaction.weight).toFixed(2)} g`;
-        document.getElementById("details-price").textContent = formatPeso(transaction.suggestedPrice);
+        document.getElementById("details-percentage").textContent = transaction.defectPercentage == null ? "Not recorded" : `${Number(transaction.defectPercentage).toFixed(3)}% defects`;
+        document.getElementById("details-reference").textContent = `${formatMoney(transaction.referencePrice, transaction.currency)}/kg`;
+        document.getElementById("details-recorded-weight").textContent = `${Number(transaction.pricingWeightKg).toFixed(4)} kg`;
+        document.getElementById("details-threshold").hidden = !transaction.overThreshold;
+        document.getElementById("details-price").textContent = formatMoney(transaction.suggestedPrice, transaction.currency);
 
         const defectList = document.getElementById("details-defect-list");
         defectList.innerHTML = "";
@@ -243,15 +246,18 @@ document.addEventListener("DOMContentLoaded", () => {
             <div class="receipt-row"><span>Detected defects</span><strong>${transaction.defects == null ? 'Not recorded' : Number(transaction.defects)}</strong></div>
             <div class="receipt-row"><span>Defects (%)</span><strong>${transaction.defectPercentage == null ? 'Not recorded' : Number(transaction.defectPercentage).toFixed(3) + '%'}</strong></div>
             <div class="receipt-row">
+                <span>Transaction weight</span><strong>${Number(transaction.pricingWeightKg).toFixed(4)} kg</strong>
+            </div>
+            <div class="receipt-row">
                 <span>Reference price</span>
-                <strong>${formatPeso(transaction.referencePrice)} / kg</strong>
+                <strong>${escapeHTML(formatMoney(transaction.referencePrice, transaction.currency))} / kg</strong>
             </div>
 
             <div class="receipt-rule"></div>
 
             <div class="receipt-total">
                 <span>SUGGESTED PRICE</span>
-                <strong>${formatPeso(transaction.suggestedPrice)}</strong>
+                <strong>${escapeHTML(formatMoney(transaction.suggestedPrice, transaction.currency))}</strong>
             </div>
 
             <div class="receipt-rule"></div>
@@ -304,8 +310,11 @@ document.addEventListener("DOMContentLoaded", () => {
             "Defects (%)",
             "Grade",
             "Confidence (%)",
-            "Reference Price (PHP/kg)",
-            "Suggested Price (PHP)"
+            "Transaction Weight (kg)",
+            "Currency",
+            "Reference Price (per kg)",
+            "Suggested Price",
+            "Over Class II Threshold"
         ];
 
         const csvRows = visibleTransactions.map((transaction) => [
@@ -319,15 +328,18 @@ document.addEventListener("DOMContentLoaded", () => {
             transaction.defectPercentage,
             transaction.grade,
             transaction.confidence,
+            transaction.pricingWeightKg,
+            transaction.currency,
             transaction.referencePrice,
-            transaction.suggestedPrice
+            transaction.suggestedPrice,
+            transaction.overThreshold
         ]);
 
         const csv = [headers, ...csvRows]
             .map((row) => row.map(csvValue).join(","))
             .join("\n");
 
-        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8;" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
@@ -343,6 +355,11 @@ document.addEventListener("DOMContentLoaded", () => {
         const string = /^[=+@\-\t\r]/.test(raw) ? "\'" + raw : raw;
         return `"${string.replaceAll('"', '""')}"`;
     }
+
+    // Back/forward cache must not restore an old list after completing a transaction.
+    window.addEventListener("pageshow", event => {
+        if (event.persisted) window.location.reload();
+    });
 
     applyFilters();
 });

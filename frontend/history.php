@@ -12,6 +12,7 @@ function history_datetime(?string $iso, string $format): string {
 
 // Read through the existing authenticated APIs; never create or repair records here.
 $transactions = [];
+$seenTransactions = [];
 $historyError = false;
 for ($skip = 0; ; $skip += 100) {
     $response = api_request('GET', "/api/transactions?skip={$skip}&limit=100");
@@ -22,6 +23,9 @@ for ($skip = 0; ; $skip += 100) {
     $batch = api_response_list($response);
     foreach ($batch as $saved) {
         if (($saved['status'] ?? '') !== 'completed') continue;
+        // Offset pages can overlap when another transaction is saved during loading.
+        if (isset($seenTransactions[$saved['id']])) continue;
+        $seenTransactions[$saved['id']] = true;
         $detail = api_request('GET', '/api/inspection/' . (int)$saved['inspection_id']);
         if ($detail['status'] !== 200 || !is_array($detail['data'])) {
             $historyError = true;
@@ -36,6 +40,9 @@ for ($skip = 0; ; $skip += 100) {
             'time' => history_datetime($saved['created_at'], 'h:i A'),
             'coffee' => 'Not recorded', // Existing schema has no coffee-type field.
             'weight' => $inspection['sample_weight_g'],
+            'pricingWeightKg' => $saved['weight_kg'],
+            'currency' => $saved['currency'],
+            'overThreshold' => $inspection['over_threshold_flag'],
             'beans' => $inspection['total_beans_detected'],
             'defects' => $hasBreakdown ? array_sum(array_column($breakdown, 'bean_count')) : null,
             'defectPercentage' => $hasBreakdown ? array_sum(array_column($breakdown, 'defect_percentage')) : null,
@@ -59,6 +66,10 @@ $extraClass = count(array_filter($transactions, fn($t) => $t["grade"] === "Extra
 $classI = count(array_filter($transactions, fn($t) => $t["grade"] === "Class I"));
 $classII = count(array_filter($transactions, fn($t) => $t["grade"] === "Class II"));
 
+function history_money($value, string $currency): string {
+    return htmlspecialchars($currency === 'PHP' ? '₱' : $currency . ' ', ENT_QUOTES, 'UTF-8') . number_format($value, 2);
+}
+
 function gradeClass($grade)
 {
     return match ($grade) {
@@ -79,7 +90,7 @@ function gradeClass($grade)
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="assets/css/history.css?v=4">
+    <link rel="stylesheet" href="assets/css/history.css?v=5">
     <link rel="stylesheet" href="assets/css/navbar.css?v=3">
 </head>
 
@@ -98,7 +109,7 @@ function gradeClass($grade)
                 <h1>Transaction History</h1>
                 <p>Review completed coffee quality assessments, inspect results, and reprint previous receipts.</p>
             </div>
-            <button type="button" class="export-btn" id="export-btn">
+            <button type="button" class="export-btn" id="export-btn" <?= $historyError || !$transactions ? "disabled" : "" ?>>
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path d="M11 3h2v10.17l3.59-3.58L18 11l-6 6-6-6 1.41-1.41L11 13.17V3ZM5 19h14v2H5v-2Z" />
                 </svg>
@@ -114,7 +125,7 @@ function gradeClass($grade)
                     </svg>
                 </div>
                 <div>
-                    <strong><?= $totalTransactions ?></strong>
+                    <strong><?= $historyError ? "—" : $totalTransactions ?></strong>
                     <span>Total transactions</span>
                 </div>
             </article>
@@ -122,7 +133,7 @@ function gradeClass($grade)
             <article class="summary-card summary-extra">
                 <div class="summary-dot"></div>
                 <div>
-                    <strong><?= $extraClass ?></strong>
+                    <strong><?= $historyError ? "—" : $extraClass ?></strong>
                     <span>Extra Class</span>
                 </div>
             </article>
@@ -130,7 +141,7 @@ function gradeClass($grade)
             <article class="summary-card summary-one">
                 <div class="summary-dot"></div>
                 <div>
-                    <strong><?= $classI ?></strong>
+                    <strong><?= $historyError ? "—" : $classI ?></strong>
                     <span>Class I</span>
                 </div>
             </article>
@@ -138,7 +149,7 @@ function gradeClass($grade)
             <article class="summary-card summary-two">
                 <div class="summary-dot"></div>
                 <div>
-                    <strong><?= $classII ?></strong>
+                    <strong><?= $historyError ? "—" : $classII ?></strong>
                     <span>Class II</span>
                 </div>
             </article>
@@ -150,7 +161,7 @@ function gradeClass($grade)
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                         <path d="m21 19-4.35-4.35A7.5 7.5 0 1 0 15.24 16L19.59 20.35 21 19ZM5 10.5a5.5 5.5 0 1 1 11 0 5.5 5.5 0 0 1-11 0Z" />
                     </svg>
-                    <input type="search" id="history-search" placeholder="Search transaction ID..." autocomplete="off">
+                    <input type="search" id="history-search" aria-label="Search transaction ID" placeholder="Search transaction ID..." autocomplete="off">
                 </div>
 
                 <div class="filter-group">
@@ -183,7 +194,7 @@ function gradeClass($grade)
                             <th>Grade</th>
                             <th>Suggested Price</th>
                             <th class="print-heading">Receipt</th>
-                            <th class="view-heading"></th>
+                            <th class="view-heading"><span class="sr-only">View details</span></th>
                         </tr>
                     </thead>
                     <tbody id="history-body">
@@ -228,8 +239,8 @@ function gradeClass($grade)
                                 </td>
 
                                 <td>
-                                    <strong class="price-value">₱<?= number_format($transaction["suggestedPrice"], 2) ?></strong>
-                                    <span class="table-sub">₱<?= number_format($transaction["referencePrice"], 2) ?>/kg ref.</span>
+                                    <strong class="price-value"><?= history_money($transaction["suggestedPrice"], $transaction["currency"]) ?></strong>
+                                    <span class="table-sub"><?= history_money($transaction["referencePrice"], $transaction["currency"]) ?>/kg ref.</span>
                                 </td>
 
                                 <td class="print-cell">
@@ -261,12 +272,12 @@ function gradeClass($grade)
                     </svg>
                 </div>
                 <h3><?= $historyError ? "History unavailable" : "No matching transactions" ?></h3>
-                <p>Try changing your search or transaction filters.</p>
+                <p><?= $historyError ? "Please refresh to retry loading saved transactions." : "Try changing your search or transaction filters." ?></p>
                 <button type="button" id="empty-reset">Clear filters</button>
             </div>
 
             <div class="table-footer">
-                <p id="result-count">Showing <?= $totalTransactions ?> transactions</p>
+                <p id="result-count" role="status" aria-live="polite">Showing <?= $totalTransactions ?> transactions</p>
             </div>
         </section>
     </main>
@@ -290,6 +301,8 @@ function gradeClass($grade)
                     </div>
                 </section>
 
+                <p id="details-threshold" role="status" hidden>Recorded defect analysis exceeds a Class II threshold.</p>
+
                 <section class="details-section">
                     <span class="details-label">SAMPLE INFORMATION</span>
                     <div class="details-list">
@@ -303,7 +316,7 @@ function gradeClass($grade)
                 <section class="details-section">
                     <div class="section-title-row">
                         <span class="details-label">DEFECT ANALYSIS</span>
-                        <span id="details-points">—</span>
+                        <span id="details-percentage">—</span>
                     </div>
                     <div class="defect-list" id="details-defect-list"></div>
                 </section>
@@ -312,7 +325,7 @@ function gradeClass($grade)
                     <span class="details-label">SUGGESTED TRANSACTIONAL PRICING</span>
                     <div class="details-list">
                         <div><span>Reference price</span><strong id="details-reference">—</strong></div>
-                        <div><span>Recorded weight</span><strong id="details-recorded-weight">—</strong></div>
+                        <div><span>Transaction weight</span><strong id="details-recorded-weight">—</strong></div>
                     </div>
                     <div class="details-total">
                         <span>Suggested price</span>
@@ -337,7 +350,7 @@ function gradeClass($grade)
     <div id="receipt-print-area" aria-hidden="true"></div>
 
     <script src="assets/js/navbar.js?v=2"></script>
-    <script src="assets/js/history.js?v=4"></script>
+    <script src="assets/js/history.js?v=5"></script>
 </body>
 
 </html>

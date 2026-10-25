@@ -90,7 +90,10 @@ def _camera_readiness():
     with _camera_lock:
         if time.monotonic() - _camera_checked_at > 2:
             try:
-                _camera_worker.request('preview', timeout=8)
+                # Picamera2 imports/configuration can exceed eight seconds on a cold Pi.
+                # Keep a shorter frame deadline once the existing child is running.
+                cold = _camera_worker.process is None or not _camera_worker.process.is_alive()
+                _camera_worker.request('preview', timeout=20 if cold else 8)
                 _camera_status = 'ready'
                 _camera_error = None
             except Exception as exc:

@@ -31,7 +31,9 @@ settings = get_settings()
 
 async def _pi_get(path: str) -> dict:
     """GET {PI_NODE_URL}{path} and return parsed JSON, or raise on failure."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    # /weight probes both devices; allow the bounded 20 s cold camera startup
+    # plus worker cleanup/response overhead, while preserving other GET deadlines.
+    async with httpx.AsyncClient(timeout=25.0 if path == "/weight" else 15.0) as client:
         resp = await client.get(settings.PI_NODE_URL.rstrip("/") + path)
         # /weight reports independent readiness even when the scale failed.
         if path == "/weight" and resp.status_code == 503:
