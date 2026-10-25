@@ -18,14 +18,16 @@ def simulated(cfg):
 
 def _worker(conn, operation):
     try:
-        from hx711_reader import _load_config, _build_hx711, read_weight_g, raw_mean, tare
+        from hx711_reader import _load_config, _build_hx711, read_weight_g, read_measurement, raw_mean, tare
         cfg = _load_config()
-        if operation in ('weight', 'tare', 'raw'):
+        if operation in ('weight', 'measurement', 'tare', 'raw'):
             import RPi.GPIO as GPIO
             try:
                 hx = _build_hx711(cfg)
                 if operation == 'weight':
                     result = read_weight_g(hx, cfg)
+                elif operation == 'measurement':
+                    result = read_measurement(hx, cfg)
                 elif operation == 'tare':
                     # tare() takes more samples for a stable baseline and saves
                     # the new offset to config.ini from inside this child process.

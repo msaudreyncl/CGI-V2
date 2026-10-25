@@ -358,6 +358,7 @@ if ($role !== 'farmer') {
 
           <div class="text-center my-4">
             <div id="live-weight-value" class="text-secondary">— g</div>
+            <div id="weight-raw-value" class="small text-muted mt-2"></div>
             <div id="weight-status-badge" class="mt-2"></div>
             <div id="weight-range-bypass" class="small text-warning mt-2"></div>
             <button type="button" id="btn-tare-scale" class="btn btn-outline-secondary btn-lg mt-3">Tare / Zero</button>

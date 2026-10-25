@@ -145,7 +145,7 @@ def filtered_sample(hx, readings=10):
         raise UnstableScaleError('Scale unstable')
     return {'raw': statistics.mean(filtered), 'spread': max(kept) - min(kept),
             'rejected': readings - len(kept), 'samples': readings,
-            'minimum': min(kept), 'maximum': max(kept)}
+            'minimum': min(kept), 'maximum': max(kept), 'raw_samples_adc': values}
 
 
 def raw_mean(hx, readings=10):
@@ -203,6 +203,7 @@ def read_measurement(hx, cfg):
         # Acquisition diagnostics: retain the actual conversion, without stability filtering.
         raw = raw_samples(hx, 1)[0]
         result = {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts',
+                  'raw_samples_adc': [raw], 'measurement_unit': 'ADC counts',
                   'weight_g': None, 'calibrated': False, 'measurement_state': 'uncalibrated'}
         try:
             factor, offset = calibration_values(cfg)
@@ -210,18 +211,20 @@ def read_measurement(hx, cfg):
             return result
         weight = (raw - offset) / factor
         if math.isfinite(weight):
-            result.update(weight_g=weight, calibrated=True, measurement_state='sensor_testing')
+            result.update(weight_g=weight, calibrated=True, measurement_state='sensor_testing', measurement_unit='g')
         return result
     try:
         factor, offset = calibration_values(cfg)
     except (ValueError, configparser.Error):
         # Keep live diagnostics available without inventing a grams conversion.
         raw = raw_samples(hx, 1)[0]
-        return {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts', 'weight_g': None,
+        return {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts', 'raw_samples_adc': [raw],
+                'measurement_unit': 'ADC counts', 'weight_g': None,
                 'calibrated': False, 'measurement_state': 'uncalibrated'}
     sample = filtered_sample(hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE'))
     raw = sample['raw']
-    result = {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts'}
+    result = {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts',
+              'raw_samples_adc': sample['raw_samples_adc'], 'measurement_unit': 'g'}
     if sample['spread'] / abs(factor) > tolerance_g(cfg):
         raise UnstableScaleError('Scale moving or noisy; wait for it to settle')
     weight = (raw - offset) / factor

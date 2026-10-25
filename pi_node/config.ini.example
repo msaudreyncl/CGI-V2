@@ -36,6 +36,9 @@ HX711_DT_PIN  = 5
 HX711_SCK_PIN = 6
 # Calibration factor (run hx711_reader.py --calibrate to find this value).
 # May be negative — sign depends on load cell wiring orientation.
+# 1.0 is an uncalibrated placeholder: readings display as ADC counts.
+# Conversion requires CALIBRATION_VERIFIED=true and a finite nonzero factor/offset.
+# Existing factors must be verified with the calibration wizard; tare never enables calibration.
 CALIBRATION_FACTOR = 1.0
 # Set by the verification wizard, never by guessing a factor/sign.
 CALIBRATION_VERIFIED = false

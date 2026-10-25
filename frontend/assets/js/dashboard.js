@@ -534,12 +534,14 @@
             document.getElementById('btn-to-capture').disabled = !sensorTestMode;
             weightReadAt = Date.now();
             document.getElementById('live-weight-value').textContent = '— g';
+            document.getElementById('weight-raw-value').textContent = '';
             document.getElementById('weight-status-badge').textContent = 'Stabilizing…';
             weightPollTimer = setInterval(() => {
                 if (Date.now() - weightReadAt > 10000) {
                     currentWeight = null;
                     document.getElementById('btn-to-capture').disabled = !sensorTestMode;
                     document.getElementById('live-weight-value').textContent = '—';
+                    document.getElementById('weight-raw-value').textContent = '';
                     document.getElementById('weight-status-badge').textContent = 'Reading expired — reconnecting…';
                 }
                 _pollWeight();
@@ -573,6 +575,12 @@
                         const resp = await API.get('/api/hardware/weight');
                         const data = await resp.json();
                         if (generation !== weightPollGeneration) return;
+                        const rawAge = Date.now() - Date.parse(data.measured_at);
+                        const rawLive = data.scale === 'ready' && data.simulated === false
+                            && Number.isFinite(rawAge) && rawAge >= 0 && rawAge <= 10000;
+                        document.getElementById('weight-raw-value').textContent =
+                            rawLive && Number.isFinite(data.raw_adc)
+                                ? 'Raw Sensor Value (ADC counts): ' + String(data.raw_adc) : '';
                         if (data.sensor_test_mode === true) sensorTestMode = true;
                         if (sensorTestMode) {
                             document.getElementById('btn-to-capture').disabled = false;
@@ -635,9 +643,8 @@
                         weightMeasuredAt = null;
                         document.getElementById('btn-to-capture').disabled = !sensorTestMode;
                         document.getElementById('live-weight-value').textContent = '— g';
-                        document.getElementById('weight-status-badge').innerHTML =
-                            '<span class="badge bg-secondary"></span>';
-                        document.querySelector('#weight-status-badge span').textContent = e.message;
+                        document.getElementById('weight-raw-value').textContent = '';
+                        document.getElementById('weight-status-badge').textContent = e.message;
                         return;
                     }
                 }
