@@ -28,14 +28,20 @@ def _read_weight():
     cfg = _load_config()
     with _scale_lock:
         try:
-            weight = 350.0 if simulated(cfg) else run_hardware('weight')
+            measurement = ({'weight_g': 350.0, 'raw_adc': None, 'calibrated': False,
+                            'measurement_unit': 'g'} if simulated(cfg)
+                           else run_hardware('measurement'))
+            weight = measurement['weight_g']
+            if weight is None:
+                _last_weight = None
+                return dict(measurement, stable=False, in_range=False)
             if not math.isfinite(weight):
                 raise ValueError('Scale returned a nonfinite reading')
             now = time.monotonic()
             stable = (_last_weight is not None and now - _last_read_at < 10
                       and abs(weight - _last_weight) <= 0.5)
             _last_weight, _last_read_at = weight, now
-            return weight, stable, 340 <= weight <= 360
+            return dict(measurement, stable=stable, in_range=340 <= weight <= 360)
         except Exception:
             _last_weight = None
             raise
@@ -109,12 +115,11 @@ class PiRequestHandler(BaseHTTPRequestHandler):
         payload = {'camera': _camera_readiness(), 'camera_error': _camera_error,
                    'scale': 'error', 'simulated': simulated(_load_config())}
         try:
-            weight, stable, in_range = _read_weight()
-            payload.update(weight_g=round(weight, 2), stable=stable,
-                           in_range=in_range, scale='ready')
+            measurement = _read_weight()
+            payload.update(measurement, scale='ready')
             self._send_json(200, payload)
         except Exception as exc:
-            payload.update(error=str(exc), weight_g=None, stable=False, in_range=False)
+            payload.update(error=str(exc), raw_adc=None, weight_g=None, calibrated=False, stable=False, in_range=False)
             self._send_json(503, payload)
 
     def do_POST(self):

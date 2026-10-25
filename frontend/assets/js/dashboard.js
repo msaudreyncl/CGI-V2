@@ -533,13 +533,31 @@
         
                 if (devMode) {
                     // Simulate weight ramping to a stable 350 g
+                    document.getElementById('weight-raw-value').textContent = '';
                     ({ weight_g: w, stable, in_range: inRange } = DEV.getWeight());
                 } else {
                     try {
                         const resp = await API.get('/api/hardware/weight');
-                        if (!resp.ok) throw new Error('Scale unavailable');
+                        if (!resp.ok) {
+                            const error = await resp.json();
+                            throw new Error(error.detail || 'Scale unavailable');
+                        }
                         const data = await resp.json();
                         if (generation !== weightPollGeneration) return;
+                        const raw = data.raw_adc;
+                        const rawLabel = document.getElementById('weight-raw-value');
+                        rawLabel.textContent = raw != null && Number.isFinite(Number(raw))
+                            ? 'Raw Sensor Value (ADC counts): ' + Number(raw).toLocaleString('en-US', { maximumFractionDigits: 20 })
+                            : '';
+                        if (data.weight_g == null && raw != null && Number.isFinite(Number(raw))) {
+                            currentWeight = null;
+                            document.getElementById('live-weight-value').textContent =
+                                Number(raw).toLocaleString('en-US', { maximumFractionDigits: 20 }) + ' ADC counts';
+                            document.getElementById('weight-status-badge').textContent = 'Weight in grams is not calibrated';
+                            document.getElementById('btn-to-capture').disabled = true;
+                            return;
+                        }
+                        if (data.calibrated === false && !data.simulated) throw new Error('Weight is not calibrated');
                         w = Number(data.weight_g);
                         if (data.weight_g == null || !Number.isFinite(w)) throw new Error('Invalid weight');
                         stable  = data.stable;
@@ -549,8 +567,8 @@
                         currentWeight = null;
                         document.getElementById('btn-to-capture').disabled = true;
                         document.getElementById('live-weight-value').textContent = '— g';
-                        document.getElementById('weight-status-badge').innerHTML =
-                            '<span class="badge bg-secondary">Scale unreachable</span>';
+                        document.getElementById('weight-raw-value').textContent = '';
+                        document.getElementById('weight-status-badge').textContent = e.message;
                         return;
                     }
                 }

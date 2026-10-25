@@ -49,7 +49,7 @@ def _build_hx711(cfg: configparser.ConfigParser):
     return hx
 
 
-def _stable_raw(hx, readings: int, outlier_iqr_mult: float = 1.5) -> float:
+def _stable_raw(hx, readings: int, outlier_iqr_mult: float = 1.5, samples=None) -> float:
     """Return a stable, outlier-filtered mean of `readings` HX711 ADC samples.
 
     Strategy:
@@ -63,12 +63,16 @@ def _stable_raw(hx, readings: int, outlier_iqr_mult: float = 1.5) -> float:
     """
     def _collect_and_filter():
         raw = hx.get_raw_data(times=readings + 4)
-        # Reject sentinels and non-finite values
+        if not isinstance(raw, (list, tuple)):
+            return None
+        if samples is not None:
+            samples.extend(raw)
+        # Reject invalid data and values outside the signed 24-bit ADC range.
         clean = [
             v for v in raw
-            if not isinstance(v, bool)
-            and math.isfinite(float(v))
-            and v not in _HX711_SENTINELS
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v)
+            and -8388608 < v < 8388607
         ]
         if len(clean) < readings:
             return None
@@ -128,20 +132,51 @@ def tare(hx, readings: int = 20) -> float:
     return offset
 
 
+def calibration_parameters(cfg):
+    """Accept finite, saved calibration; factor +/-1 is a legacy placeholder.
+
+    An explicit CALIBRATED=false disables conversion. Existing non-placeholder
+    factors with a saved offset remain usable without rewriting configuration.
+    """
+    try:
+        factor = cfg.getfloat('load_cell', 'CALIBRATION_FACTOR')
+        offset = cfg.getfloat('load_cell', 'ZERO_OFFSET')
+        confirmed = cfg.getboolean('load_cell', 'CALIBRATED', fallback=None)
+        if (confirmed is False or not math.isfinite(factor)
+                or not math.isfinite(offset) or factor == 0
+                or (abs(factor) == 1 and confirmed is not True)):
+            return None
+        return factor, offset
+    except (ValueError, configparser.Error):
+        return None
+
+
+def read_measurement(hx, cfg):
+    """Keep the original filtered ADC mean separate from optional grams."""
+    samples = []
+    raw = _stable_raw(hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE', fallback=10), samples=samples)
+    parameters = calibration_parameters(cfg)
+    weight = None
+    if parameters is not None:
+        factor, offset = parameters
+        weight = (raw - offset) / factor
+        if not math.isfinite(weight):
+            raise ValueError('Invalid scale calibration or reading')
+    # Preserve original finite samples, including saturation values, for diagnosis.
+    # Invalid entries become null for strict JSON serialization.
+    samples = [v if isinstance(v, (int, float)) and not isinstance(v, bool)
+               and math.isfinite(v) else None for v in samples]
+    return {'raw_adc': raw, 'raw_samples_adc': samples, 'weight_g': weight,
+            'calibrated': parameters is not None,
+            'measurement_unit': 'g' if parameters is not None else 'ADC counts'}
+
+
 def read_weight_g(hx, cfg: configparser.ConfigParser) -> float:
     """Convert a filtered raw ADC reading to grams using calibration parameters."""
-    factor = cfg.getfloat('load_cell', 'CALIBRATION_FACTOR')
-    if not math.isfinite(factor) or factor == 0:
-        raise ValueError(
-            'CALIBRATION_FACTOR is 0 or invalid — run the calibration wizard: '
-            'python hx711_reader.py --calibrate'
-        )
-    offset = cfg.getfloat('load_cell', 'ZERO_OFFSET', fallback=0.0)
-    n = cfg.getint('load_cell', 'READINGS_TO_AVERAGE', fallback=10)
-    weight = (_stable_raw(hx, n) - offset) / factor
-    if not math.isfinite(weight):
-        raise ValueError('Invalid scale calibration or reading')
-    return weight
+    measurement = read_measurement(hx, cfg)
+    if not measurement['calibrated']:
+        raise ValueError('Weight in grams is not calibrated; use raw ADC readings')
+    return measurement['weight_g']
 
 
 def is_weight_in_range(weight_g: float, cfg: configparser.ConfigParser) -> bool:
@@ -204,6 +239,7 @@ def main():
                         'Calibration factor is zero — the scale did not respond to the load. '
                         'Check wiring and ensure the load cell is properly mounted.'
                     )
+                cfg.set('load_cell', 'CALIBRATED', 'true')
                 cfg.set('load_cell', 'CALIBRATION_FACTOR', str(factor))
                 cfg.set('load_cell', 'ZERO_OFFSET', str(offset))
                 save_scale_config(cfg)
@@ -219,8 +255,8 @@ def main():
         print('Reading weight — press Ctrl+C to stop.\n')
         try:
             while True:
-                weight = read_weight_g(hx, cfg)
-                print(f'\r  {weight:+8.2f} g   ', end='', flush=True)
+                measurement = read_measurement(hx, cfg)
+                print(measurement, flush=True)
                 time.sleep(0.5)
         except KeyboardInterrupt:
             print('\nStopped.')
