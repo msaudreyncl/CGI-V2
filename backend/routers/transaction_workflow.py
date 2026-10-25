@@ -10,6 +10,7 @@ Endpoints:
     GET  /api/transaction/{pid}           — fetch current pending row state
 """
 
+import json
 import logging
 import random
 import string
@@ -19,6 +20,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from routers.hardware import _pi_get
+from services.scale_measurement import measurement_status, sensor_testing_status
 from config import get_settings
 from database import get_db
 from models.user import User, UserRole
@@ -61,7 +64,7 @@ class TransactionInitRequest(BaseModel):
 
 
 class WeightUpdateRequest(BaseModel):
-    weight_g: float = Field(allow_inf_nan=False)
+    weight_g: float | None = Field(default=None, allow_inf_nan=False)
     measured_at: datetime | None = None
 
 
@@ -110,7 +113,7 @@ def init_transaction(
 
 
 @router.put("/{pending_id}/weight", response_model=PendingTransactionOut)
-def update_weight(
+async def update_weight(
     pending_id: int,
     body: WeightUpdateRequest,
     db: Session = Depends(get_db),
@@ -119,21 +122,47 @@ def update_weight(
     """
     Stage 2 — Weight: save the validated weight to the pending row.
 
-    Validates 340 ≤ weight_g ≤ 360 (HTTP 422 if out of range).
+    Rechecks fresh calibrated/stable Pi grams; range bypass skips only 340–360 g.
     Updates status to 'weighed'.
     """
     pending = db.get(PendingTransaction, pending_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending transaction not found.")
 
-    if not settings.WEIGHT_TEST_MODE and not (settings.WEIGHT_MIN_G <= body.weight_g <= settings.WEIGHT_MAX_G):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Weight {body.weight_g:.1f} g is outside the accepted range "
-                f"({settings.WEIGHT_MIN_G:.0f}–{settings.WEIGHT_MAX_G:.0f} g)."
-            ),
-        )
+    if pending.status in (PendingStatus.analyzed, PendingStatus.completed):
+        raise HTTPException(status_code=409, detail="Sample already analyzed. Start a new transaction to change its weight.")
+
+    if settings.WEIGHT_SENSOR_TEST_MODE:
+        try:
+            data = await _pi_get('/weight')
+        except Exception:
+            data = {'scale':'error', 'error':'Scale unavailable'}
+        diagnostic = sensor_testing_status(data)
+        # Store any magnitude/unit in existing metadata, never in DECIMAL grams.
+        # Capture remains available; unvalidated testing data cannot feed analysis/pricing.
+        pending.weight_g = None
+        pending.weight_metadata = json.dumps({
+            'sensor_test_mode':True,
+            'sensor_reading':diagnostic.get('sensor_reading') or diagnostic.get('latest_sensor_reading'),
+            'scale_status_at_confirmation':data.get('scale', 'error'),
+            'confirmed_at':datetime.now(timezone.utc).isoformat(),
+        }, allow_nan=False)
+        pending.status = PendingStatus.weighed
+        db.commit()
+        db.refresh(pending)
+        return PendingTransactionOut.model_validate(pending)
+
+    # Re-read the physical scale: client grams/status cannot authorize a transaction.
+    try:
+        measurement = measurement_status(await _pi_get('/weight'), settings.WEIGHT_TEST_MODE)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Scale unavailable") from exc
+    if not measurement['weight_gate_passed']:
+        raise HTTPException(status_code=422, detail=measurement.get(
+            'status_message', 'Weight is outside the accepted range (340–360 g).'))
+    # Save the authoritative current grams, never an earlier browser reading.
+    body.weight_g = measurement['weight_g']
+    body.measured_at = datetime.fromisoformat(measurement['measured_at'].replace('Z', '+00:00'))
 
     logging.getLogger(__name__).warning(
         "HX711 weight received pending_id=%s txn_number=%s weight_g=%r measured_at=%s",
@@ -143,6 +172,11 @@ def update_weight(
     # Respect the existing DECIMAL(7,2) capacity; never clamp an over-capacity value.
     if abs(body.weight_g) > 99999.99:
         raise HTTPException(status_code=422, detail="Reading exceeds existing weight storage capacity (99999.99 g).")
+    pending.weight_metadata = json.dumps({
+        'weight_range_bypass_used': measurement['bypass_weight_range'],
+        'measured_at': measurement['measured_at'],
+        'accepted_weight_g': body.weight_g,
+    })
     pending.weight_g = body.weight_g
     pending.status   = PendingStatus.weighed
     db.commit()
@@ -166,4 +200,24 @@ def get_pending(
     pending = db.get(PendingTransaction, pending_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending transaction not found.")
+    return PendingTransactionOut.model_validate(pending)
+
+
+@router.delete("/{pending_id}/weight", response_model=PendingTransactionOut)
+def invalidate_weight(
+    pending_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(UserRole.admin, UserRole.officer)),
+):
+    """Returning to Weight requires a new confirmation before captures can proceed."""
+    pending = db.get(PendingTransaction, pending_id)
+    if not pending:
+        raise HTTPException(status_code=404, detail="Pending transaction not found.")
+    if pending.status in (PendingStatus.analyzed, PendingStatus.completed):
+        raise HTTPException(status_code=409, detail="Sample already analyzed. Start a new transaction.")
+    pending.weight_g = None
+    pending.weight_metadata = None
+    pending.status = PendingStatus.prepared
+    db.commit()
+    db.refresh(pending)
     return PendingTransactionOut.model_validate(pending)

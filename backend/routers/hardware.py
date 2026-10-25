@@ -15,6 +15,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 import httpx
 
+from services.scale_measurement import measurement_status, sensor_testing_status
+from database import get_db
+from sqlalchemy.orm import Session
+from models.pending_transaction import PendingTransaction, PendingStatus
 from config import get_settings
 from models.user import User, UserRole
 from auth import require_role
@@ -119,6 +123,7 @@ async def hardware_status(
         "printer": printer_status,
         "simulated": data.get("simulated", False),
         "details": details,
+        "sensor_test_mode": settings.WEIGHT_SENSOR_TEST_MODE,
     }
 
 
@@ -130,18 +135,20 @@ async def get_weight(
     Proxy a live weight reading from the Pi node.
 
     Returns:
-        weight_g  — current reading in grams
-        stable    — True when consecutive readings differ by ≤ 0.5 g
+        raw_counts / raw_adc — sensor ADC counts, independent of calibration
+        weight_g  — verified calibrated grams, or null when uncalibrated
+        calibrated — whether a verified grams conversion was applied
+        stable    — recent timed window within configured MAX_SPREAD_G
+        valid_weight / weight_gate_passed — fresh measurement and range gate
         in_range  — True when 340 ≤ weight_g ≤ 360
     """
     try:
         data = await _pi_get("/weight")
+        if settings.WEIGHT_SENSOR_TEST_MODE:
+            return sensor_testing_status(data)
         if data.get("scale") == "error":
             raise HTTPException(status_code=503, detail=data.get("error", "Scale unavailable"))
-        data["weight_test_mode"] = (settings.WEIGHT_TEST_MODE and
-                                    data.get("weight_test_mode") is True and
-                                    data.get("simulated") is False)
-        return data
+        return measurement_status(data, settings.WEIGHT_TEST_MODE)
     except HTTPException:
         raise
     except httpx.ConnectError:
@@ -209,6 +216,7 @@ class HardwareWeightAction(BaseModel):
 @router.post("/weight")
 async def tare_weight(
     body: HardwareWeightAction,
+    db: Session = Depends(get_db),
     _: User = Depends(require_role(UserRole.admin, UserRole.officer)),
 ):
     """Tare or calibrate through the existing weight resource."""
@@ -216,7 +224,17 @@ async def tare_weight(
                             "calibration_finish", "calibration_cancel"):
         raise HTTPException(status_code=400, detail="Unknown scale action")
     try:
-        return await _pi_post("/weight", body.model_dump(exclude_none=True))
+        result = await _pi_post("/weight", body.model_dump(exclude_none=True))
+        if body.action in ('tare', 'calibration_finish'):
+            # A changed zero/calibration invalidates in-progress sample acceptance.
+            db.query(PendingTransaction).filter(PendingTransaction.status.in_(
+                [PendingStatus.weighed, PendingStatus.captured])).update({
+                    PendingTransaction.weight_g: None,
+                    PendingTransaction.weight_metadata: None,
+                    PendingTransaction.status: PendingStatus.prepared,
+                }, synchronize_session=False)
+            db.commit()
+        return result
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=503, detail=exc.response.json().get("error", "Scale action failed"))
     except Exception as exc:

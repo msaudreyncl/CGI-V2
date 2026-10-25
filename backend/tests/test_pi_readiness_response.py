@@ -28,7 +28,7 @@ def test_readiness_response(monkeypatch, failure):
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'simulation')
     monkeypatch.setattr(pi_server, '_load_config', load)
     monkeypatch.setattr(pi_server, '_camera_readiness', camera)
-    monkeypatch.setattr(pi_server, '_read_weight', lambda: (350.0, True, True))
+    monkeypatch.setattr(pi_server, '_read_weight', lambda: ({'weight_g': 350.0}, True, True))
     monkeypatch.setattr(pi_server, '_camera_error', None)
     server = pi_server.ThreadingHTTPServer(('127.0.0.1', 0), pi_server.PiRequestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

@@ -39,6 +39,14 @@ if ($role !== 'farmer') {
     line-height: 1;
 }
 
+/* Raw ADC labels must fit the existing weight panel. */
+#live-weight-value.raw-sensor-reading {
+    font-size: 1.5rem;
+    letter-spacing: normal;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+}
+
 /* Capture preview images */
 .capture-preview {
     max-height: 200px;
@@ -351,7 +359,8 @@ if ($role !== 'farmer') {
           <div class="text-center my-4">
             <div id="live-weight-value" class="text-secondary">— g</div>
             <div id="weight-status-badge" class="mt-2"></div>
-            <button type="button" id="btn-tare-scale" class="btn btn-outline-secondary btn-lg mt-3">Tare empty scale</button>
+            <div id="weight-range-bypass" class="small text-warning mt-2"></div>
+            <button type="button" id="btn-tare-scale" class="btn btn-outline-secondary btn-lg mt-3">Tare / Zero</button>
             <button type="button" id="btn-calibrate-scale" class="btn btn-outline-secondary btn-lg mt-3">Calibrate scale</button>
             <div class="small text-muted mt-2">Remove the beans and leave the empty tray before taring.</div>
           </div>
@@ -598,7 +607,7 @@ if ($role !== 'farmer') {
 <?php api_inject_jwt_script(); ?>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="<?= APP_BASE ?>/assets/js/navbar.js?v=3"></script>
-<script src="<?= APP_BASE ?>/assets/js/dashboard.js?v=3"
+<script src="<?= APP_BASE ?>/assets/js/dashboard.js?v=9"
         data-app-base="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>"
         data-api-base=""></script>
 <script src="<?= htmlspecialchars(APP_BASE, ENT_QUOTES, 'UTF-8') ?>/assets/js/api.js"></script>

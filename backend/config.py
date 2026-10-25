@@ -77,6 +77,8 @@ class Settings:
         if o.strip()
     ]
 
+    WEIGHT_SENSOR_TEST_MODE: bool = os.getenv("WEIGHT_SENSOR_TEST_MODE", "false").lower() == "true"
+
     WEIGHT_TEST_MODE: bool = os.getenv("WEIGHT_TEST_MODE", "false").lower() == "true"
 
     # Weight enforcement

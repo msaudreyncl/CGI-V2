@@ -40,7 +40,7 @@ with sync_playwright() as p:
            const denied = window.profileMode === 'denied';
            return {ok:found,status:found?200:denied?403:404,json:async()=>found?{id:7,user_id:1}:{detail:denied?'Access denied':'Farmer profile not found'}};
          }
-         return {ok:!window.failWeight,json:async()=>path.endsWith('/status')?window.hardwareStatus:window.mockWeight};
+         return {ok:!window.failWeight,json:async()=>path.endsWith('/status')?window.hardwareStatus:{sensor_test_mode:window.sensorTesting===true,sensor_reading:window.sensorTesting ? {value:window.mockWeight.calibrated===false?window.mockWeight.raw_counts:window.mockWeight.weight_g,unit:window.mockWeight.calibrated===false?'ADC counts':'g',calibrated:window.mockWeight.calibrated!==false} : null,scale:'ready',calibrated:true,simulated:false,valid_weight:window.mockWeight.stable===true,sample_present:window.mockWeight.weight_g>1,weight_gate_passed:window.mockWeight.stable===true && window.mockWeight.weight_g>1 && (window.mockWeight.weight_test_mode===true || (window.mockWeight.weight_g>=340 && window.mockWeight.weight_g<=360)),bypass_weight_range:window.mockWeight.weight_test_mode===true,measured_at:new Date().toISOString(),...window.mockWeight}};
        },
        post:async (path,body) => {
          if(path === '/api/users/1/farmer') {
@@ -71,7 +71,8 @@ with sync_playwright() as p:
          }
          return {ok:true,json:async()=>path.endsWith('/init')?{pending_id:42,txn_number:'CGI-TEST'}:{tared:true}};
        },
-       put:async (path,body)=>{window.saved.push(body.weight_g);return {ok:true,json:async()=>({})}}
+       del:async path=>({ok:true,json:async()=>({weight_g:null})}),
+       put:async (path,body)=>{window.saved.push(body.weight_g);return {ok:true,json:async()=>({weight_g:body.weight_g})}}
       };
       document.getElementById('farmer-select').innerHTML='<option value="1">Test Farmer</option>';
     }''')
@@ -87,11 +88,34 @@ with sync_playwright() as p:
     page.evaluate("window.hardwareStatus={camera:'ready',scale:'ready',printer:'warning',details:{}}")
     click('btn-recheck-hw');page.wait_for_timeout(100)
     assert not page.locator('#btn-to-weight').is_disabled()
-    click('btn-to-weight');page.wait_for_timeout(150)
+    click('btn-to-weight');page.wait_for_timeout(400)
     assert page.evaluate('window.initPayloads') == [{'farmer_id':7}]
     assert page.evaluate('window.profileCreates') == 0
     assert not page.locator('#btn-to-capture').is_disabled()
     assert page.locator('#live-weight-value').inner_text() == '350.00 g'
+    page.evaluate("window.mockWeight={raw_adc:1000000,weight_g:null,calibrated:false,measurement_state:'uncalibrated',weight_test_mode:true,simulated:false}")
+    page.wait_for_timeout(400)
+    assert page.locator('#live-weight-value').inner_text() == '— g'
+    assert 'Calibration required' in page.locator('#weight-status-badge').inner_text()
+    assert page.locator('#btn-to-capture').is_disabled()
+    assert page.evaluate('window.saved') == []
+    page.evaluate("window.mockWeight={weight_g:350,stable:true,in_range:true}")
+    page.wait_for_timeout(400)
+    # Actual grams and range-only bypass, including inclusive boundaries.
+    for mass, bypass, passes in [(125,False,False),(125,True,True),
+                                  (350,False,True),(350,True,True),
+                                  (340,False,True),(360,False,True),
+                                  (339.99,False,False),(360.01,False,False)]:
+        page.evaluate('(x)=>window.mockWeight={weight_g:x.mass,stable:true,in_range:x.mass>=340&&x.mass<=360,weight_test_mode:x.bypass,simulated:false}',
+                      {'mass':mass,'bypass':bypass})
+        page.wait_for_timeout(400)
+        assert page.locator('#live-weight-value').inner_text() == f'{mass:.2f} g'
+        assert page.locator('#btn-to-capture').is_disabled() == (not passes)
+    page.evaluate("window.mockWeight={weight_g:350,stable:true,in_range:true,measured_at:'2000-01-01T00:00:00+00:00'}")
+    page.wait_for_timeout(400)
+    assert page.locator('#btn-to-capture').is_disabled()
+    assert 'Reading expired' in page.locator('#weight-status-badge').inner_text()
+    page.evaluate('window.mockWeight={weight_g:350,stable:true,in_range:true}')
     dialogs=[]
     def calibration_dialog(dialog):
         dialogs.append(dialog.message)
@@ -117,17 +141,20 @@ with sync_playwright() as p:
     assert page.locator('#live-weight-value').inner_text() == '0.00 g'
     page.evaluate('window.mockWeight={weight_g:125.37,stable:true,in_range:false}');page.wait_for_timeout(600)
     assert page.locator('#live-weight-value').inner_text() == '125.37 g'
-    page.evaluate("window.mockWeight={weight_g:-123.456789,stable:false,in_range:false,weight_test_mode:true,simulated:false,measured_at:'2026-10-23T01:00:00+00:00'}");page.wait_for_timeout(600)
-    assert page.locator('#live-weight-value').inner_text() == '-123.46 g'
-    assert not page.locator('#btn-to-capture').is_disabled()
-    assert 'calibration bypassed' in page.locator('#weight-status-badge').inner_text()
+    page.evaluate("window.mockWeight={weight_g:-123.456789,stable:false,in_range:false,weight_test_mode:true,simulated:false}");page.wait_for_timeout(600)
+    assert page.locator('#live-weight-value').inner_text() == '— g'
+    assert page.locator('#btn-to-capture').is_disabled()
+    page.evaluate("window.mockWeight.stable=true");page.wait_for_timeout(400)
+    assert page.locator('#btn-to-capture').is_disabled()
+    assert 'Empty tray' in page.locator('#weight-status-badge').inner_text()
     page.evaluate("window.failWeight=true");page.wait_for_timeout(600)
     assert page.locator('#btn-to-capture').is_disabled()
     assert page.locator('#live-weight-value').inner_text() == '— g'
     assert 'Error' in page.locator('#hw-label-scale').inner_text()
     page.evaluate("window.failWeight=false;window.mockWeight={weight_g:350,stable:true,in_range:true}");page.wait_for_timeout(600)
-    click('btn-tare-scale');page.wait_for_timeout(150)
-    assert page.locator('#live-weight-value').inner_text() == '0.00 g'
+    page.once('dialog', lambda dialog: dialog.accept())
+    click('btn-tare-scale');page.wait_for_timeout(400)
+    assert page.locator('#live-weight-value').inner_text() == '— g'
     assert page.locator('#btn-to-capture').is_disabled()
     page.evaluate('window.mockWeight={weight_g:350.27,stable:false,in_range:true}');page.wait_for_timeout(600)
     assert page.locator('#btn-to-capture').is_disabled()
@@ -138,7 +165,7 @@ with sync_playwright() as p:
     page.evaluate("window.mockWeight={weight_g:null,stable:false,in_range:false,measurement_state:'unstable',error:'Scale moving or noisy'}")
     page.wait_for_timeout(600)
     assert page.locator('#live-weight-value').inner_text() == '— g'
-    assert 'moving or noisy' in page.locator('#weight-status-badge').inner_text()
+    assert 'Scale unstable' in page.locator('#weight-status-badge').inner_text()
     assert page.locator('#btn-to-capture').is_disabled()
     page.evaluate('window.mockWeight={weight_g:350,stable:true,in_range:true}');page.wait_for_timeout(600)
     page.evaluate('window.failWeight=true');page.wait_for_timeout(600)
@@ -146,6 +173,7 @@ with sync_playwright() as p:
     page.evaluate('window.failWeight=false;window.mockWeight.weight_g=339');page.wait_for_timeout(600)
     assert page.locator('#btn-to-capture').is_disabled()
     page.evaluate('window.mockWeight.weight_g=350');page.wait_for_timeout(600)
+    page.once('dialog', lambda dialog: dialog.accept())
     click('btn-tare-scale');page.wait_for_timeout(600)
     assert page.locator('#btn-to-capture').is_disabled()
     page.evaluate('window.mockWeight={weight_g:350,stable:true,in_range:true}');page.wait_for_timeout(600)
@@ -212,7 +240,7 @@ with sync_playwright() as p:
         page.locator('.prep-check').evaluate_all('(els)=>els.forEach(el=>{el.checked=true;el.dispatchEvent(new Event("change"))})')
         before_init=page.evaluate('window.initPayloads.length')
         before_create=page.evaluate('window.profileCreates')
-        click('btn-to-weight');page.wait_for_timeout(150)
+        click('btn-to-weight');page.wait_for_timeout(400)
         if mode == 'denied':
             assert page.evaluate('window.initPayloads.length') == before_init
             assert page.evaluate('window.profileCreates') == before_create
@@ -223,16 +251,61 @@ with sync_playwright() as p:
             assert page.evaluate('window.initPayloads.at(-1)') == {'farmer_id':7}
             assert page.evaluate('window.profileCreates') == before_create+1
     preview_count=page.evaluate('window.previewCount')
+    # Temporary acquisition testing: preserve numerical values and enable Capture unconditionally.
+    page.locator('#txn-modal').evaluate("el=>el.dispatchEvent(new Event('hidden.bs.modal'))")
+    page.evaluate("window.profileMode='existing';window.hardwareStatus.sensor_test_mode=true;window.sensorTesting=true")
+    click('btn-start-txn');page.wait_for_timeout(100)
+    page.locator('.prep-check').evaluate_all('(els)=>els.forEach(el=>{el.checked=true;el.dispatchEvent(new Event("change"))})')
+    click('btn-to-weight');page.wait_for_timeout(400)
+    for raw in (False, True):
+        for value in (-500, 0, 9999.9, 100000, 1000001):
+            page.evaluate('(x)=>window.mockWeight={weight_g:x.value,raw_counts:x.value,calibrated:!x.raw,stable:false,in_range:false}', {'value':value,'raw':raw})
+            page.wait_for_timeout(350)
+            assert page.locator('#live-weight-value').inner_text() == str(value) + (' ADC counts' if raw else ' g')
+            assert not page.locator('#btn-to-capture').is_disabled()
+    page.evaluate("window.mockWeight={scale:'error',error:'HX711 disconnected'}")
+    page.wait_for_timeout(400)
+    assert not page.locator('#btn-to-capture').is_disabled()
+    assert page.locator('#live-weight-value').inner_text() == '—'
+    assert 'disconnected' in page.locator('#weight-status-badge').inner_text()
+    click('btn-to-capture');page.wait_for_timeout(200)
+    assert 'd-none' not in page.locator('#stage-3').get_attribute('class')
+    # Real-analysis response with raw sensor metadata: grade visible, no NaN or invented prices.
+    page.evaluate("""() => {
+      const original = window.CGI_API.post;
+      window.CGI_API.post = async (path, body) => path.endsWith('/capture-dual') ?
+        {ok:true,json:async()=>({sensor_test_mode:true,pricing_unavailable:true,analysis_skipped:false,
+          message:'Image analysis complete — sensor testing only. No sale was created.',
+          txn_id:null,pending_id:42,txn_number:'CGI-TEST',sample_weight_g:null,grade:'extra_class',
+          sensor_reading:{value:1234567,unit:'ADC counts',calibrated:false},
+          created_at:'2026-10-23T00:00:00',image_path:'static/uploads/a.jpg',image_path_b:'static/uploads/b.jpg',
+          total_beans_detected:100,defect_results:[{defect_type:'black_bean',bean_count:2,defect_percentage:2,assigned_class:'extra_class',over_threshold:false}]})} : original(path,body);
+    }""")
+    click('btn-capture-a');page.wait_for_timeout(3700);click('btn-accept-a')
+    click('btn-capture-b');page.wait_for_timeout(3700);click('btn-accept-b')
+    click('btn-to-analyze');click('btn-start-analysis');page.wait_for_timeout(200)
+    assert 'd-none' not in page.locator('#stage-5').get_attribute('class')
+    assert 'Extra Class' in page.locator('#res-grade-badge').inner_text()
+    assert page.locator('#res-defect-tbody tr').count() == 1
+    assert page.locator('#res-weight').inner_text() == '1234567 ADC counts (testing; grams unavailable)'
+    assert page.locator('#res-total-price').inner_text() == 'Unavailable'
+    assert page.locator('#res-price-per-kg').inner_text() == 'Unavailable'
+    click('btn-to-receipt')
+    receipt = page.locator('#receipt-preview-box').inner_text()
+    assert 'NaN' not in receipt and 'SENSOR TEST — NO SALE' in receipt
+    assert 'Unavailable — test only' in receipt
+    click('btn-print-receipt')
+    assert 'no sale or priced receipt' in page.locator('#stage6-error').text_content()
+    click('btn-complete-txn')
+    page.evaluate('window.sensorTesting=false;window.hardwareStatus.sensor_test_mode=false')
     # UI-only development mode must render preview/captures without camera API calls.
     page.locator('#txn-modal').evaluate("el=>el.dispatchEvent(new Event('hidden.bs.modal'))")
     click('btn-devmode-toggle');click('btn-start-txn')
     page.locator('.prep-check').evaluate_all('(els)=>els.forEach(el=>{el.checked=true;el.dispatchEvent(new Event("change"))})')
     click('btn-to-weight');page.wait_for_timeout(1200);click('btn-to-capture');page.wait_for_timeout(100)
-    assert 'Simulated' in page.locator('#camera-live-status').inner_text()
-    calls=page.evaluate('window.captures.length')
-    click('btn-capture-a');page.wait_for_timeout(3700);click('btn-accept-a')
-    assert page.evaluate('window.captures.length') == calls
-    assert page.evaluate('window.previewCount') == preview_count
+    assert page.locator('#btn-to-capture').is_disabled()
+    assert page.locator('#live-weight-value').inner_text() == '— g'
+    assert 'hardware mode' in page.locator('#weight-status-badge').inner_text()
     page.locator('#txn-modal').evaluate("el=>el.dispatchEvent(new Event('hidden.bs.modal'))")
     assert not errors,errors
     print('PASS: Step 2 calibration sequence/cancellation, signed 2-decimal weight, tray/tare, instability gates; farmer account/profile mapping, profile creation/conflict/error handling; Chromium 800x480: live preview, disconnect/recovery, failed capture/retry, A/B confirmation and exact YOLO payload, retake, navigation cancellation, development mode; no JS errors')

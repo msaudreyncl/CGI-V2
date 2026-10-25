@@ -1,5 +1,6 @@
 """routers/inspection.py — Inspection capture and listing endpoints."""
 
+import json
 import base64
 import math
 import os
@@ -18,7 +19,7 @@ from models.transaction import Transaction, TransactionStatus, PrintStatus, Pric
 from models.pending_transaction import PendingTransaction, PendingStatus
 from schemas.inspection import (
     InspectionOut, InspectionListItem, CapturePayload,
-    DualCapturePayload, DualInspectionOut, AnalysisBypassOut,
+    DualCapturePayload, DualInspectionOut, AnalysisBypassOut, SensorAnalysisOut,
 )
 from auth import get_current_user, require_role
 from services.detection import run_detection, run_detection_with_annotation
@@ -140,7 +141,7 @@ def get_inspection(
     return InspectionOut.model_validate(inspection)
 
 
-@router.post("/capture-dual", response_model=DualInspectionOut | AnalysisBypassOut,
+@router.post("/capture-dual", response_model=DualInspectionOut | SensorAnalysisOut | AnalysisBypassOut,
              status_code=status.HTTP_201_CREATED)
 async def capture_dual_and_analyze(
     body: DualCapturePayload,
@@ -165,13 +166,22 @@ async def capture_dual_and_analyze(
     pending = db.get(PendingTransaction, body.pending_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending transaction not found.")
-    if pending.weight_g is None:
+    if pending.status in (PendingStatus.analyzed, PendingStatus.completed):
+        raise HTTPException(status_code=409, detail="This sample has already been analyzed.")
+    try:
+        weight_metadata = json.loads(pending.weight_metadata or '{}')
+    except (ValueError, TypeError):
+        weight_metadata = {}
+    sensor_testing = (settings.WEIGHT_SENSOR_TEST_MODE
+                      and weight_metadata.get('sensor_test_mode') is True
+                      and pending.status in (PendingStatus.weighed, PendingStatus.captured))
+    if pending.weight_g is None and not sensor_testing:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Weight has not been recorded for this transaction. Complete Stage 2 first.",
         )
 
-    weight_g = float(pending.weight_g)
+    weight_g = float(pending.weight_g) if pending.weight_g is not None else None
 
     # 2. Decode and save both raw images
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
@@ -206,6 +216,8 @@ async def capture_dual_and_analyze(
                 message="Analysis skipped — trained YOLOv8 model unavailable. No grade or price was generated.",
                 pending_id=pending.id, txn_number=pending.txn_number,
                 created_at=pending.created_at, sample_weight_g=weight_g,
+                sensor_test_mode=sensor_testing,
+                sensor_reading=weight_metadata.get('sensor_reading') if sensor_testing else None,
                 image_path=f"static/uploads/{uid}_a.jpg",
                 image_path_b=f"static/uploads/{uid}_b.jpg",
             )
@@ -249,11 +261,35 @@ async def capture_dual_and_analyze(
         rel_a_ann = f"static/uploads/{uid}_a_annotated.jpg" if ann_bytes_a else None
         rel_b_ann = f"static/uploads/{uid}_b_annotated.jpg" if ann_bytes_b else None
 
+        if sensor_testing:
+            result = SensorAnalysisOut(
+                message='Image analysis complete — sensor testing only. Sample weight and pricing are unavailable; no sale was created.',
+                pending_id=pending.id, txn_number=pending.txn_number,
+                created_at=pending.created_at, sample_weight_g=None,
+                sensor_reading=weight_metadata.get('sensor_reading'),
+                image_path=rel_a_raw, image_path_b=rel_b_raw,
+                image_path_annotated_a=rel_a_ann, image_path_annotated_b=rel_b_ann,
+                grade=grading_result['grade'],
+                total_beans_detected=grading_result['total_beans'],
+                over_threshold_flag=grading_result['over_threshold_flag'],
+                defect_results=[dict(defect_type=d['defect_type'], bean_count=d['count'],
+                    defect_percentage=d['percentage'], assigned_class=d['assigned_class'],
+                    over_threshold=d['over_threshold']) for d in grading_result['defect_breakdown']],
+            )
+            # Existing inspection/sale tables require real grams. Retain this test result
+            # in existing pending metadata instead of fabricating a weight or schema.
+            weight_metadata['sensor_analysis'] = result.model_dump(mode='json')
+            pending.weight_metadata = json.dumps(weight_metadata, allow_nan=False)
+            pending.status = PendingStatus.analyzed
+            db.commit()
+            return result
+
         # 7. Persist Inspection row, carrying forward pending transaction data
         inspection = Inspection(
             farmer_id             = pending.farmer_id,
             officer_id            = current_user.id,
             sample_weight_g       = weight_g,
+            notes                 = pending.weight_metadata,
             total_beans_detected  = grading_result["total_beans"],
             image_path            = rel_a_raw,
             image_path_b          = rel_b_raw,

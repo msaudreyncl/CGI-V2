@@ -85,9 +85,28 @@ class AnalysisBypassOut(BaseModel):
     txn_id: None = None
     txn_number: str
     created_at: datetime
-    sample_weight_g: float
+    sample_weight_g: Optional[float] = None
+    sensor_test_mode: bool = False
+    sensor_reading: Optional[dict] = None
     image_path: str
     image_path_b: str
     grade: None = None
     total_beans_detected: None = None
     defect_results: list = []
+
+
+class SensorAnalysisOut(AnalysisBypassOut):
+    """Real inference/grade retained on the pending test, without a sale or grams."""
+    analysis_skipped: bool = False
+    sensor_test_mode: bool = True
+    pricing_unavailable: bool = True
+    grade: GradeEnum
+    total_beans_detected: int
+    over_threshold_flag: bool
+    image_path_annotated_a: Optional[str] = None
+    image_path_annotated_b: Optional[str] = None
+    defect_results: list[dict]
+    price_per_kg: None = None
+    market_rate_per_kg: None = None
+    multiplier: None = None
+    total_price: None = None

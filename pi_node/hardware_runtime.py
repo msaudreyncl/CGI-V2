@@ -150,7 +150,7 @@ class CameraWorker:
 def _scale_worker(conn):
     """Keep the HX711 initialized across reads and tare; one GPIO owner."""
     from hx711_reader import (_load_config, _build_hx711, read_weight_g,
-                              collect_reference, filtered_sample, tare, UnstableScaleError)
+                              collect_reference, filtered_sample, read_measurement, tare, UnstableScaleError)
     try:
         import RPi.GPIO as GPIO
         if multiprocessing.current_process().name != 'MainProcess':
@@ -165,7 +165,9 @@ def _scale_worker(conn):
                 break
             try:
                 cfg = _load_config()  # Reload persisted zero/factor without resetting ADC.
-                if operation == 'weight':
+                if operation == 'measurement':
+                    result = read_measurement(hx, cfg)
+                elif operation == 'weight':
                     result = read_weight_g(hx, cfg)
                 elif operation == 'probe':
                     result = filtered_sample(hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE'))
@@ -232,7 +234,7 @@ class ScaleWorker:
             self.process.start()
             child.close()
             self.pins = pins
-        timeout = timeout if timeout is not None else {'weight': 8, 'probe': 8, 'reference': 20, 'tare': 25}[operation]
+        timeout = timeout if timeout is not None else {'measurement': 8, 'weight': 8, 'probe': 8, 'reference': 20, 'tare': 25}[operation]
         try:
             self.conn.send(operation)
             if not self.conn.poll(timeout):

@@ -135,6 +135,7 @@
         let weightPollGeneration = 0;
         let weightRequestBusy = false;
         let weightSaving = false;
+        let sensorTestMode = false;
         let tareBusy = false;
         let weightReadAt = 0;
         let weightMeasuredAt = null;
@@ -208,15 +209,7 @@
                 return 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg)));
             },
         
-            // Simulate a stable 350.0 g weight reading (ticks up from 348 for realism)
-            _weightTick: 0,
-            getWeight() {
-                this._weightTick = Math.min(this._weightTick + 1, 3);
-                const w = 348.0 + this._weightTick * 0.7;  // 348.7 → 349.4 → 350.1
-                const stable = this._weightTick >= 2;
-                return { weight_g: parseFloat(w.toFixed(1)), stable, in_range: w >= 340 && w <= 360 };
-            },
-            resetWeight() { this._weightTick = 0; },
+
         
             // Generate a DEV transaction number (no DB call)
             makeTxnNumber() {
@@ -286,7 +279,6 @@
             imageBb64       = null;
             currentAnalysis = null;
             analysisRunning = false;
-            DEV.resetWeight();
             // Restore modal banner visibility to match current devMode state
             _applyDevModeUI();
         });
@@ -384,7 +376,6 @@
             pendingId = txnNumber = txnId = null;
             currentWeight = imageAb64 = imageBb64 = currentAnalysis = null;
             analysisRunning = false;
-            DEV.resetWeight();
             _stopWeightPoll();
             // Keep banner in sync
             _applyDevModeUI();
@@ -414,6 +405,7 @@
                 const resp = await API.get('/api/hardware/status');
                 if (!resp.ok) throw new Error('Hardware check failed');
                 const data = await resp.json();
+                sensorTestMode = data.sensor_test_mode === true;
                 hwCamera  = data.camera;
                 hwScale   = data.scale;
                 hwPrinter = data.printer;
@@ -528,11 +520,30 @@
         
         // ── Stage 2 — Weight ──────────────────────────────────────────────────────────
         
+        async function _invalidateAcceptedWeight() {
+            if (devMode || !pendingId) return;
+            const resp = await API.del('/api/transaction/' + pendingId + '/weight');
+            if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to reset sample weight');
+            imageAb64 = imageBb64 = currentAnalysis = null;
+            acceptedA = acceptedB = false;
+        }
+
         function _startWeightPoll() {
             _stopWeightPoll();
             currentWeight = null;
-            document.getElementById('btn-to-capture').disabled = true;
-            weightPollTimer = setInterval(_pollWeight, 12.5);
+            document.getElementById('btn-to-capture').disabled = !sensorTestMode;
+            weightReadAt = Date.now();
+            document.getElementById('live-weight-value').textContent = '— g';
+            document.getElementById('weight-status-badge').textContent = 'Stabilizing…';
+            weightPollTimer = setInterval(() => {
+                if (Date.now() - weightReadAt > 10000) {
+                    currentWeight = null;
+                    document.getElementById('btn-to-capture').disabled = !sensorTestMode;
+                    document.getElementById('live-weight-value').textContent = '—';
+                    document.getElementById('weight-status-badge').textContent = 'Reading expired — reconnecting…';
+                }
+                _pollWeight();
+            }, 250);
             _pollWeight();
         }
         
@@ -549,19 +560,63 @@
             const generation = weightPollGeneration;
             weightRequestBusy = true;
             try {
-                let w, stable, inRange, testMode = false;
+                let w, stable, inRange, gatePassed = false, samplePresent = false, testMode = false;
         
                 if (devMode) {
-                    // Simulate weight ramping to a stable 350 g
-                    ({ weight_g: w, stable, in_range: inRange } = DEV.getWeight());
+                    currentWeight = null;
+                    document.getElementById('live-weight-value').textContent = '— g';
+                    document.getElementById('weight-status-badge').textContent = 'Live weight requires hardware mode. Disable Development Mode before starting.';
+                    document.getElementById('btn-to-capture').disabled = !sensorTestMode;
+                    return;
                 } else {
                     try {
                         const resp = await API.get('/api/hardware/weight');
                         const data = await resp.json();
-                        if (!resp.ok) throw new Error(data.detail || data.error || 'Scale unavailable');
                         if (generation !== weightPollGeneration) return;
+                        if (data.sensor_test_mode === true) sensorTestMode = true;
+                        if (sensorTestMode) {
+                            document.getElementById('btn-to-capture').disabled = false;
+                            document.getElementById('weight-range-bypass').textContent = 'Sensor testing — weight validation bypassed';
+                            const reading = data.sensor_reading;
+                            const age = Date.now() - Date.parse(data.measured_at);
+                            const responding = data.scale === 'ready' && data.simulated === false;
+                            hwScale = responding ? 'ready' : 'error';
+                            _updateHwCard('scale', hwScale, data.error || '');
+                            const live = responding && reading && Number.isFinite(reading.value) && Number.isFinite(age) && age >= 0 && age <= 10000;
+                            document.getElementById('live-weight-value').classList.toggle('raw-sensor-reading', reading?.unit === 'ADC counts');
+                            document.getElementById('live-weight-value').textContent = live
+                                ? String(reading.value) + ' ' + reading.unit : '—';
+                            document.getElementById('weight-status-badge').textContent = !responding
+                                ? (data.error || 'Scale unavailable') : !live ? 'Reading expired — reconnecting…'
+                                : reading.calibrated ? 'Live calibrated reading — testing' : 'Live raw reading — calibration unavailable';
+                            if (live) weightReadAt = Date.parse(data.measured_at);
+                            return;
+                        }
+                        if (!resp.ok) throw new Error('Scale unavailable: ' + (data.detail || data.error || 'Read failed'));
+                        if (generation !== weightPollGeneration) return;
+                        const responseAge = Date.now() - Date.parse(data.measured_at);
+                        if (Number.isFinite(responseAge) && responseAge >= 0 && responseAge <= 10000) weightReadAt = Date.parse(data.measured_at);
+                        document.getElementById('weight-range-bypass').textContent =
+                            data.bypass_weight_range === true ? 'Weight range bypass enabled' : '';
                         if (data.measurement_state === 'unstable')
-                            throw new Error(data.error || 'Scale moving — wait for settling');
+                            throw new Error('Scale unstable');
+                        if (data.measurement_state === 'uncalibrated' || data.status_message === 'Calibration required') {
+                            hwScale = 'ready';
+                            _updateHwCard('scale', 'ready');
+                            document.getElementById('live-weight-value').classList.add('raw-sensor-reading');
+                            currentWeight = null;
+                            weightMeasuredAt = null;
+                            document.getElementById('btn-to-capture').disabled = !sensorTestMode;
+                            document.getElementById('live-weight-value').textContent = '— g';
+                            document.getElementById('weight-status-badge').textContent =
+                                'Calibration required';
+                            return;
+                        }
+                        const age = Date.now() - Date.parse(data.measured_at);
+                        if (data.scale !== 'ready' || data.simulated !== false || !Number.isFinite(age) || age < 0 || age > 10000)
+                            throw new Error(data.status_message || 'Reading expired — reconnecting…');
+                        if (data.calibrated !== true) throw new Error('Calibration required');
+                        if (data.stable !== true || data.valid_weight !== true) throw new Error(data.status_message || 'Stabilizing…');
                         w = Number(data.weight_g);
                         if (data.weight_g == null || !Number.isFinite(w)) throw new Error('Invalid weight');
                         hwScale = 'ready';
@@ -570,12 +625,15 @@
                         weightMeasuredAt = data.measured_at || null;
                         stable  = data.stable;
                         inRange = data.in_range;
+                        gatePassed = data.weight_gate_passed === true;
+                        samplePresent = data.sample_present === true;
                     } catch (e) {
                         if (generation !== weightPollGeneration) return;
                         hwScale = 'error';
                         _updateHwCard('scale', 'error', e.message);
                         currentWeight = null;
-                        document.getElementById('btn-to-capture').disabled = true;
+                        weightMeasuredAt = null;
+                        document.getElementById('btn-to-capture').disabled = !sensorTestMode;
                         document.getElementById('live-weight-value').textContent = '— g';
                         document.getElementById('weight-status-badge').innerHTML =
                             '<span class="badge bg-secondary"></span>';
@@ -584,27 +642,29 @@
                     }
                 }
         
+                document.getElementById('live-weight-value').classList.remove('raw-sensor-reading');
                 document.getElementById('live-weight-value').textContent = w.toFixed(2) + ' g';
         
                 let badgeHtml = '';
-                if (testMode) {
-                    badgeHtml = '<span class="badge bg-warning text-dark fs-6">Live sensor — calibration bypassed</span>';
-                } else if (!stable) {
+                if (!stable) {
                     badgeHtml = '<span class="badge bg-warning text-dark fs-6">Stabilizing…</span>';
+                } else if (!samplePresent) {
+                    badgeHtml = '<span class="badge bg-warning text-dark fs-6">Empty tray — add beans</span>';
+                } else if (testMode) {
+                    badgeHtml = '<span class="badge bg-warning text-dark fs-6">Stable — weight range bypass enabled</span>';
                 } else if (w < 340) {
-                    badgeHtml = '<span class="badge bg-danger fs-6">Insufficient — add beans</span>';
+                    badgeHtml = '<span class="badge bg-danger fs-6">Stable — add beans</span>';
                 } else if (w > 360) {
-                    badgeHtml = '<span class="badge bg-danger fs-6">Excess — remove beans</span>';
+                    badgeHtml = '<span class="badge bg-danger fs-6">Stable — remove beans</span>';
                 } else {
-                    badgeHtml = '<span class="badge bg-success fs-6">✓ Valid — proceed</span>' +
+                    badgeHtml = '<span class="badge bg-success fs-6">Stable — proceed</span>' +
                                 (devMode ? ' <span class="badge bg-warning text-dark">Simulated</span>' : '');
                 }
                 document.getElementById('weight-status-badge').innerHTML = badgeHtml;
 
-                const canProceed = Number.isFinite(w) && (testMode || (inRange && stable && w >= 340 && w <= 360));
+                const canProceed = gatePassed && Number.isFinite(w) && stable;
                 document.getElementById('btn-to-capture').disabled = !canProceed;
                 currentWeight = canProceed ? w : null;
-                weightReadAt = Date.now();
             } finally {
                 weightRequestBusy = false;
             }
@@ -612,6 +672,7 @@
 
         document.getElementById('btn-tare-scale').addEventListener('click', async () => {
             if (tareBusy || weightSaving) return;
+            if (!devMode && !window.confirm('Remove all samples and leave the empty tray installed before taring.')) return;
             tareBusy = true;
             _stopWeightPoll();
             currentWeight = null;
@@ -622,8 +683,8 @@
             document.getElementById('btn-calibrate-scale').disabled = true;
             _hideError('stage2-error');
             try {
-                if (devMode) DEV.resetWeight();
-                else {
+                if (!devMode) {
+                    await _invalidateAcceptedWeight();
                     const resp = await API.post('/api/hardware/weight', { action: 'tare' });
                     if (!resp.ok) {
                         const err = await resp.json();
@@ -646,7 +707,7 @@
                 _showError('stage2-error', 'Calibration requires real HX711 hardware. Turn off Development Mode.');
                 return;
             }
-            if (!window.confirm('Remove all removable loads, including the tray. Leave the fixed platform, let it settle, then press OK to measure zero.')) return;
+            if (!window.confirm('Remove all samples. Leave the empty tray installed, let it settle, then press OK to measure zero.')) return;
             tareBusy = true;
             _stopWeightPoll();
             currentWeight = null;
@@ -669,12 +730,12 @@
                 if (entered === null) return;
                 const known = Number(entered);
                 if (!Number.isFinite(known) || known <= 0) throw new Error('Reference mass must be a positive number in grams.');
-                if (!window.confirm('Place ONLY the known ' + known + ' g reference on the platform. Let it settle, then press OK.')) return;
+                if (!window.confirm('Place ONLY the known ' + known + ' g reference in the empty tray. Let it settle, then press OK.')) return;
                 await action('calibration_load', {known_g: known});
-                if (!window.confirm('Remove the reference mass. Leave the bare fixed platform, let it settle, then press OK to verify zero and save.')) return;
+                if (!window.confirm('Remove the reference mass. Leave the empty tray installed, let it settle, then press OK to verify zero and save.')) return;
                 await action('calibration_finish');
                 token = null;
-                window.alert('Calibration saved. Verify an independent known mass, then place the empty tray and tare before adding beans.');
+                window.alert('Calibration saved. Verify an independent known mass, then tare with the empty tray installed before adding beans.');
             } catch (e) {
                 _showError('stage2-error', e.message);
             } finally {
@@ -696,7 +757,7 @@
         });
         
         document.getElementById('btn-to-capture').addEventListener('click', async () => {
-            if (currentWeight === null || Date.now() - weightReadAt > 10000 || weightSaving || tareBusy) return;
+            if (weightSaving || tareBusy || (!sensorTestMode && (currentWeight === null || Date.now() - weightReadAt > 10000))) return;
             _stopWeightPoll();
             weightSaving = true;
             _hideError('stage2-error');
@@ -721,6 +782,8 @@
                     _startWeightPoll();
                     return;
                 }
+                const accepted = await resp.json();
+                currentWeight = accepted.weight_g == null ? null : Number(accepted.weight_g);
             } catch (e) {
                 _showError('stage2-error', 'Network error: ' + e.message);
                 weightSaving = false;
@@ -933,7 +996,9 @@
         document.getElementById('btn-accept-a').addEventListener('click', () => _acceptView('A'));
         document.getElementById('btn-accept-b').addEventListener('click', () => _acceptView('B'));
         
-        document.getElementById('btn-back-to-weight').addEventListener('click', () => {
+        document.getElementById('btn-back-to-weight').addEventListener('click', async () => {
+            try { await _invalidateAcceptedWeight(); }
+            catch (e) { _showError('stage3-error', e.message); return; }
             imageAb64 = imageBb64 = null;
             acceptedA = acceptedB = false;
             document.getElementById('btn-to-analyze').disabled = true;
@@ -1016,12 +1081,15 @@
         // ── Stage 5 — Results ─────────────────────────────────────────────────────────
         
         function _renderResults(data) {
+            document.getElementById('btn-to-receipt').textContent = data.sensor_test_mode ? 'Review test summary →' : 'Continue to Receipt →';
+            document.getElementById('btn-complete-txn').textContent = data.sensor_test_mode ? 'Close sensor test' : '✔ Complete Transaction';
             document.getElementById('res-txn-number').textContent = data.txn_number || txnNumber;
             document.getElementById('res-date').textContent =
                 data.created_at ? data.created_at.replace('T', ' ').slice(0, 16) : '—';
             document.getElementById('res-farmer').textContent = farmerName || '—';
-            document.getElementById('res-weight').textContent =
-                parseFloat(data.sample_weight_g).toFixed(1) + ' g  (' +
+            document.getElementById('res-weight').textContent = data.sample_weight_g == null
+                ? (data.sensor_reading ? String(data.sensor_reading.value) + ' ' + data.sensor_reading.unit + ' (testing; grams unavailable)' : 'Unavailable — sensor testing')
+                : parseFloat(data.sample_weight_g).toFixed(1) + ' g  (' +
                 (parseFloat(data.sample_weight_g)/1000).toFixed(3) + ' kg)';
         
             const gradeBadge = document.getElementById('res-grade-badge');
@@ -1085,7 +1153,7 @@
                 _setImg('res-img-b-ann', 'res-img-b-ann-link', data.image_path_annotated_b);
             }
         
-            if (data.analysis_skipped) {
+            if (data.analysis_skipped || data.pricing_unavailable) {
                 for (const id of ['res-market-rate', 'res-multiplier', 'res-price-per-kg', 'res-total-price'])
                     document.getElementById(id).textContent = 'Unavailable';
                 document.getElementById('res-price-source').textContent = data.message;
@@ -1116,11 +1184,11 @@
             if (!d) return;
             const gradeLabel = d.analysis_skipped ? 'SKIPPED — MODEL UNAVAILABLE' : _gradeLabel(d.grade);
             const date       = (d.created_at || '').replace('T', ' ').slice(0, 16);
-            const weightKg   = (parseFloat(d.sample_weight_g) / 1000).toFixed(3);
+            const weightLabel = d.sample_weight_g == null ? 'Unavailable — sensor test' : (parseFloat(d.sample_weight_g) / 1000).toFixed(3) + ' kg';
             const lines = [
                 '            CGI',
                 '  Coffee Grade Identification',
-                devMode ? '  *** DEVELOPMENT MODE — NOT A REAL RECORD ***' : '',
+                d.sensor_test_mode ? '  SENSOR TEST — NO SALE OR SAMPLE PRICE' : devMode ? '  *** DEVELOPMENT MODE — NOT A REAL RECORD ***' : '',
                 '─'.repeat(36),
                 _pad32('Txn No  : ', d.txn_number || txnNumber),
                 _pad32('Date    : ', date),
@@ -1128,10 +1196,10 @@
                 '─'.repeat(36),
                 _pad32('Grade   : ', gradeLabel),
                 d.over_threshold_flag ? '! OVER THRESHOLD - LOW VALUE !' : '',
-                _pad32('Weight  : ', weightKg + ' kg'),
-                _pad32('Price/kg: ', d.analysis_skipped ? 'Unavailable' : _phpFormat(d.price_per_kg)),
+                _pad32('Weight  : ', weightLabel),
+                _pad32('Price/kg: ', (d.analysis_skipped || d.pricing_unavailable) ? 'Unavailable' : _phpFormat(d.price_per_kg)),
                 '─'.repeat(36),
-                _pad32('TOTAL   : ', d.analysis_skipped ? 'Unavailable — test only' : _phpFormat(d.total_price)),
+                _pad32('TOTAL   : ', (d.analysis_skipped || d.pricing_unavailable) ? 'Unavailable — test only' : _phpFormat(d.total_price)),
                 '─'.repeat(36),
                 devMode ? '     [DEV] Simulated — no printer required' : '         Thank you!',
                 '       CGI System v1.0',
@@ -1156,6 +1224,11 @@
                 return;
             }
         
+            if (currentAnalysis?.sensor_test_mode) {
+                _showError('stage6-error', 'Sensor test only: no sale or priced receipt was created.');
+                btn.disabled = false;
+                return;
+            }
             if (currentAnalysis?.analysis_skipped) {
                 _showError('stage6-error', 'Analysis was skipped. No finalized transaction or printable graded receipt was created.');
                 btn.disabled = false;
@@ -1197,7 +1270,7 @@
                 return;
             }
         
-            if (currentAnalysis?.analysis_skipped) { txnModal.hide(); return; }
+            if (currentAnalysis?.analysis_skipped || currentAnalysis?.sensor_test_mode) { txnModal.hide(); return; }
             if (!txnId) { btn.disabled = false; return; }
         
             try {

@@ -7,7 +7,7 @@ forward from here into the final Inspection row.
 """
 
 import enum
-from sqlalchemy import Column, Integer, String, Numeric, DateTime, Enum as SAEnum, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, Numeric, DateTime, Enum as SAEnum, ForeignKey
 from sqlalchemy.sql import func
 from database import Base
 
@@ -29,7 +29,8 @@ class PendingTransaction(Base):
     farmer_id   = Column(Integer, ForeignKey("farmers.id"), nullable=False)
     officer_id  = Column(Integer, ForeignKey("users.id"),   nullable=False)
     weight_g    = Column(Numeric(7, 2), nullable=True,
-                         comment="Populated at Weight stage (must be 340–360 g)")
+                         comment="Actual grams accepted by the live scale gate")
+    weight_metadata = Column(Text, nullable=True)
     status      = Column(SAEnum(PendingStatus), nullable=False,
                          default=PendingStatus.prepared)
     created_at  = Column(DateTime, nullable=False, server_default=func.now())

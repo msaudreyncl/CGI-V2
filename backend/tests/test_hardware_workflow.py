@@ -23,16 +23,22 @@ import hardware_runtime
 from tests.test_integration import client, admin_token, officer_token, farmer_id, _TestSession, _auth_header
 
 
+@pytest.fixture(autouse=True)
+def normal_weight_gate(monkeypatch):
+    from routers import transaction_workflow
+    monkeypatch.setattr(transaction_workflow.settings, 'WEIGHT_TEST_MODE', False)
+
+
 def config():
     cfg = configparser.ConfigParser()
     cfg.read_dict({'hardware': {'MODE': 'simulation'}, 'load_cell': {
-        'CALIBRATION_FACTOR': '-100', 'ZERO_OFFSET': '10000', 'READINGS_TO_AVERAGE': '10',
+        'STABILITY_DURATION_S': '0.000001', 'CALIBRATION_FACTOR': '-100', 'ZERO_OFFSET': '10000', 'READINGS_TO_AVERAGE': '10',
         'CALIBRATION_VERIFIED': 'true', 'HX711_DT_PIN': '5', 'HX711_SCK_PIN': '6'}})
     return cfg
 
 
 def test_pinned_driver_raw_conversion_and_invalid_data():
-    hx = Mock()
+    hx = Mock(_cgi_next_read_at=0.0)
     hx._read.return_value = -25000
     assert hx711_reader.read_weight_g(hx, config()) == 350
     hx._read.return_value = False
@@ -66,6 +72,13 @@ def test_worker_deadline_reaps_stuck_driver():
 
 @pytest.fixture
 def pi_http(monkeypatch):
+    original_load = pi_server._load_config
+    def normal_config():
+        cfg = original_load()
+        if cfg.has_section('load_cell'):
+            cfg.set('load_cell', 'WEIGHT_SENSOR_TEST_MODE', 'false')
+        return cfg
+    monkeypatch.setattr(pi_server, '_load_config', normal_config)
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'simulation')
     pi_server._last_weight = None
     worker = hardware_runtime.CameraWorker()
@@ -93,7 +106,14 @@ def test_hardware_to_saved_dual_transaction(client, officer_token, farmer_id, pi
     monkeypatch.setattr(inspection.settings, 'UPLOAD_DIR', str(tmp_path))
     headers = _auth_header(officer_token)
     status = client.get('/api/hardware/status', headers=headers).json()
-    assert status == {'camera': 'ready', 'scale': 'ready', 'printer': 'warning', 'simulated': True, 'details': {}}
+    assert status == {'camera': 'ready', 'scale': 'ready', 'printer': 'warning', 'simulated': True, 'details': {}, 'sensor_test_mode': False}
+    # Explicit mocked physical payloads; simulated service readings cannot transact.
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server, '_load_config', config)
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(return_value={
+        'weight_g':350.0, 'calibrated':True, 'measurement_state':'calibrated'}))
+    from tests.test_integration import _tiny_jpeg_b64
+    monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(return_value=base64.b64decode(_tiny_jpeg_b64())))
     assert client.post('/api/hardware/weight', headers=headers, json={'action': 'tare'}).json()['tared']
     first = client.get('/api/hardware/weight', headers=headers).json()
     second = client.get('/api/hardware/weight', headers=headers).json()
@@ -102,10 +122,11 @@ def test_hardware_to_saved_dual_transaction(client, officer_token, farmer_id, pi
     init = client.post('/api/transaction/init', headers=headers, json={'farmer_id': farmer_id})
     assert init.status_code == 201, init.text
     pending_id = init.json()['pending_id']
-    for invalid in [339.9, 360.1]:
-        assert client.put(f'/api/transaction/{pending_id}/weight', headers=headers, json={'weight_g': invalid}).status_code == 422
-    for valid in [340, 360, second['weight_g']]:
-        assert client.put(f'/api/transaction/{pending_id}/weight', headers=headers, json={'weight_g': valid}).status_code == 200
+    # Submitted grams are untrusted: every save re-reads and stores actual 350 g.
+    for submitted in [339.9, 360.1, 340, 360, 350]:
+        saved = client.put(f'/api/transaction/{pending_id}/weight', headers=headers, json={'weight_g':submitted})
+        assert saved.status_code == 200, saved.text
+        assert saved.json()['weight_g'] == 350
     images = []
     for view in ('A', 'B'):
         captured = client.post('/api/hardware/capture', headers=headers, json={'view': view})
@@ -293,10 +314,12 @@ def test_signed_filtered_weight_and_unstable_state_reach_frontend_api(client, of
     monkeypatch.setattr(pi_server, '_load_config', config)
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
     monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(return_value=b'frame'))
-    readings = Mock(side_effect=[0.0, 100.25, -100.25, UnstableScaleError('Scale moving; wait'), 350.0, 350.0])
+    readings = Mock(side_effect=[{'weight_g': w, 'calibrated': True} if isinstance(w, float) else w for w in
+        [0.0, 0.0, 100.25, 100.25, -100.25, -100.25, UnstableScaleError('Scale moving; wait'), 350.0, 350.0]])
     monkeypatch.setattr(pi_server._scale_worker, 'request', readings)
     headers = _auth_header(officer_token)
     for expected in [0.0, 100.25, -100.25]:
+        assert client.get('/api/hardware/weight', headers=headers).json()['weight_g'] is None
         response = client.get('/api/hardware/weight', headers=headers)
         assert response.status_code == 200
         assert response.json()['weight_g'] == expected
@@ -319,24 +342,24 @@ def test_raw_samples_to_tare_api_and_saved_transaction(client, officer_token, fa
     hx711_reader.save_scale_config(cfg)
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
     monkeypatch.setattr(pi_server._camera_worker, 'request', Mock(return_value=b'frame'))
-    hx = Mock()
+    hx = Mock(_cgi_next_read_at=0.0)
     hx._read.side_effect = ([10000]*10 + [110000]*10 + [110000]*40 + [110000]*10
-                           + [460000]*20 + [110000]*10 + [10000]*10
+                           + [460000]*30 + [110000]*10 + [10000]*10
                            + [110000+i*100 for i in range(10)])
     def request(operation):
         if operation == 'tare':
             return hx711_reader.tare(hx)
-        return hx711_reader.read_weight_g(hx, hx711_reader._load_config())
+        return hx711_reader.read_measurement(hx, hx711_reader._load_config())
     monkeypatch.setattr(pi_server._scale_worker, 'request', request)
     headers = _auth_header(officer_token)
     def weight():
         resp = client.get('/api/hardware/weight', headers=headers)
         assert resp.status_code == 200, resp.text
         return resp.json()
-    assert weight()['weight_g'] == 0
-    assert weight()['weight_g'] == 100
+    assert weight()['weight_g'] is None  # Fresh but not yet temporally stable
+    assert weight()['weight_g'] is None
     assert client.post('/api/hardware/weight', headers=headers, json={'action':'tare'}).status_code == 200
-    assert weight()['weight_g'] == 0
+    assert weight()['weight_g'] is None  # Fresh but not yet temporally stable
     assert weight()['stable'] is False
     loaded = weight()
     assert loaded['weight_g'] == 350 and loaded['stable'] and loaded['in_range']
@@ -347,8 +370,8 @@ def test_raw_samples_to_tare_api_and_saved_transaction(client, officer_token, fa
     assert saved.status_code == 200
     with _TestSession() as db:
         assert float(db.get(PendingTransaction,pending_id).weight_g) == 350
-    assert weight()['weight_g'] == 0
-    assert weight()['weight_g'] == -100
+    assert weight()['weight_g'] is None  # Fresh but not yet temporally stable
+    assert weight()['weight_g'] is None
     noisy = weight()
     assert noisy['weight_g'] is None and noisy['measurement_state'] == 'unstable'
     assert not noisy['stable'] and not noisy['in_range']
@@ -377,7 +400,7 @@ def test_website_weight_actions_through_http_and_raw_hx711(client, officer_token
         if operation == 'reference': return hx711_reader.collect_reference(adc, cfg)
         if operation == 'probe': return hx711_reader.filtered_sample(adc)
         if operation == 'tare': return hx711_reader.tare(adc)
-        return hx711_reader.read_weight_g(adc, cfg)
+        return hx711_reader.read_measurement(adc, cfg)
     monkeypatch.setattr(pi_server._scale_worker, 'request', request)
     headers = _auth_header(officer_token)
     def post(action, **extra):
@@ -448,7 +471,7 @@ def test_browser_calibration_through_authenticated_api_and_pi_http(client, offic
         if operation == 'reference': return hx711_reader.collect_reference(adc, cfg)
         if operation == 'probe': return hx711_reader.filtered_sample(adc)
         if operation == 'tare': return hx711_reader.tare(adc)
-        return hx711_reader.read_weight_g(adc, cfg)
+        return hx711_reader.read_measurement(adc, cfg)
     monkeypatch.setattr(pi_server._scale_worker, 'request', request)
     html = re.sub(r'<\?.*?\?>', '', (root/'frontend/dashboard.php').read_text(), flags=re.S)
     html = re.sub(r'<script\b[^>]*>.*?</script>', '', html, flags=re.S)
@@ -474,6 +497,8 @@ def test_browser_calibration_through_authenticated_api_and_pi_http(client, offic
                         response = client.get(path, headers=_auth_header(officer_token))
                     return route.fulfill(status=response.status_code, body=response.text,
                                          content_type='application/json')
+                if route.request.method == 'DELETE' and path.endswith('/weight'):
+                    return route.fulfill(json={'weight_g':None})
                 if path == '/api/users/1/farmer':
                     return route.fulfill(json={'id':7, 'user_id':1})
                 if path.endswith('/init'):
@@ -484,7 +509,7 @@ def test_browser_calibration_through_authenticated_api_and_pi_http(client, offic
             page.evaluate('''() => {
               for(let i=1;i<=6;i++){const e=document.createElement('span');e.id='step-badge-'+i;document.body.appendChild(e);}
               window.bootstrap={Modal:class {constructor(el){this.el=el} show(){} hide(){}}};
-              window.CGI_API={get:path=>fetch(path),post:(path,body)=>fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})};
+              window.CGI_API={del:path=>fetch(path,{method:'DELETE'}),get:path=>fetch(path),post:(path,body)=>fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})};
               document.getElementById('farmer-select').innerHTML='<option value="1">Test Farmer</option>';
             }''')
             page.add_script_tag(content=(root/'frontend/assets/js/dashboard.js').read_text())
@@ -526,30 +551,54 @@ def test_acquisition_negative_unstable_http_to_transaction(
     from models.pending_transaction import PendingTransaction
     cfg = config()
     cfg.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
-    cfg.set('load_cell', 'CALIBRATION_VERIFIED', 'false')
+    cfg.set('load_cell', 'CALIBRATION_VERIFIED', 'true')
     monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
     monkeypatch.setattr(pi_server, '_load_config', lambda: cfg)
     monkeypatch.setattr(pi_server, '_camera_readiness', lambda: 'ready')
-    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(return_value=-123.456789))
+    monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(return_value={'raw_adc': 123345.6789, 'weight_g': -123.456789, 'calibrated': True}))
     monkeypatch.setattr(hardware.settings, 'WEIGHT_TEST_MODE', True)
     monkeypatch.setattr(transaction_workflow.settings, 'WEIGHT_TEST_MODE', True)
     headers = _auth_header(officer_token)
+    first = client.get('/api/hardware/weight', headers=headers).json()
+    assert first['weight_g'] is None and not first['valid_weight']
     reading = client.get('/api/hardware/weight', headers=headers).json()
     assert reading['weight_g'] == -123.456789
     assert reading['weight_test_mode'] and not reading['simulated']
-    assert not reading['stable'] and not reading['in_range']
+    assert reading['stable'] and not reading['in_range']
     assert reading['measured_at']
     pending_id = client.post('/api/transaction/init', headers=headers,
                              json={'farmer_id': farmer_id}).json()['pending_id']
     saved = client.put(f'/api/transaction/{pending_id}/weight', headers=headers,
                        json={'weight_g': reading['weight_g'], 'measured_at': reading['measured_at']})
-    assert saved.status_code == 200, saved.text
+    assert saved.status_code == 422, saved.text
     with _TestSession() as db:
-        assert float(db.get(PendingTransaction, pending_id).weight_g) == -123.46
-    assert '-123.456789' in caplog.text and reading['measured_at'] in caplog.text
+        assert db.get(PendingTransaction, pending_id).weight_g is None
+    assert not reading['sample_present']
+    assert not reading['weight_gate_passed']
+    # A rejected negative reading was never recorded.  # Save acquired a newer reading.
     monkeypatch.setattr(pi_server._scale_worker, 'request', Mock(side_effect=RuntimeError('Disconnected')))
     assert client.get('/api/hardware/weight', headers=headers).status_code == 503
     assert client.get('/api/hardware/status', headers=headers).json()['scale'] == 'error'
     monkeypatch.setattr(transaction_workflow.settings, 'WEIGHT_TEST_MODE', False)
     assert client.put(f'/api/transaction/{pending_id}/weight', headers=headers,
                       json={'weight_g': -123.456789}).status_code == 422
+
+
+def test_uncalibrated_million_counts_through_authenticated_proxy(client, officer_token, pi_http, monkeypatch):
+    cfg = config()
+    cfg.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
+    cfg.set('load_cell', 'CALIBRATION_VERIFIED', 'false')
+    monkeypatch.setenv('CGI_HARDWARE_MODE', 'hardware')
+    monkeypatch.setattr(pi_server, '_load_config', lambda: cfg)
+    monkeypatch.setattr(pi_server, '_camera_readiness', lambda: 'ready')
+    adc = Mock(_cgi_next_read_at=0.0)
+    adc._read.side_effect = [1000000, 1100000, 1000005]
+    monkeypatch.setattr(pi_server._scale_worker, 'request',
+                        lambda operation: hx711_reader.read_measurement(adc, cfg))
+    for raw in [1000000, 1100000, 1000005]:
+        response = client.get('/api/hardware/weight', headers=_auth_header(officer_token))
+        assert response.status_code == 200
+        data = response.json()
+        assert data['raw_adc'] == raw and data['raw_unit'] == 'ADC counts'
+        assert data['weight_g'] is None and not data['calibrated']
+        assert not data['stable'] and not data['in_range']

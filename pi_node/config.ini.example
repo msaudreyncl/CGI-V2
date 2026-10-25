@@ -25,7 +25,10 @@ LENS_POSITION =
 AUTOFOCUS_WAIT = 1.5
 
 [load_cell]
-# Temporary acquisition testing only; bypass accuracy/stability checks.
+# Temporary acquisition-only Stage 2 mode; never writes raw counts as grams.
+WEIGHT_SENSOR_TEST_MODE = false
+# Bypass ONLY the 340–360 g range; calibration, freshness and stability still required.
+# Enable WEIGHT_TEST_MODE in the backend .env as well.
 WEIGHT_TEST_MODE = false
 # GPIO data pin connected to HX711 DT
 HX711_DT_PIN  = 5
@@ -36,12 +39,18 @@ HX711_SCK_PIN = 6
 CALIBRATION_FACTOR = 1.0
 # Set by the verification wizard, never by guessing a factor/sign.
 CALIBRATION_VERIFIED = false
-# Maximum accepted spread within a batch/reference (grams).
+# Maximum accepted spread within a batch/reference and between readings (grams).
+# Existing 0.5 g acceptance target; verify against observed empty/loaded noise.
 MAX_SPREAD_G = 0.5
+# Continuous recent-window stability; tune using real empty/loaded observations.
+STABILITY_DURATION_S = 1.0
+UNSTABLE_AFTER_S = 8.0
+# Minimum distinguishable sample mass above empty-tray noise; tune physically.
+SAMPLE_NOISE_FLOOR_G = 1.0
 # Persisted by --tare / --calibrate and the transaction Tare button.
 ZERO_OFFSET = 0
 # Samples collected per weight reading (more = slower but smoother).
-# The reader collects READINGS_TO_AVERAGE + 4 samples and discards outliers.
+# 5–40 valid samples; rolling median of 5 followed by a short mean.
 READINGS_TO_AVERAGE = 20
 # Acceptable weight range for 350 g sample (grams)
 WEIGHT_MIN_G = 340

@@ -13,6 +13,7 @@ class PendingTransactionOut(BaseModel):
     farmer_id:   int
     officer_id:  int
     weight_g:    Optional[float]
+    weight_metadata: Optional[str] = None
     status:      PendingStatus
     created_at:  datetime
 

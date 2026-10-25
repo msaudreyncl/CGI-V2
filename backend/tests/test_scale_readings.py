@@ -340,7 +340,10 @@ def test_acquisition_mode_preserves_single_conversion_without_verification(raw):
     config.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
     config.set('load_cell', 'CALIBRATION_VERIFIED', 'false')
     adc = Samples([raw, 12345])
-    assert scale.read_weight_g(adc, config) == (raw - 10000) / 1000
+    result = scale.read_measurement(adc, config)
+    assert result['raw_adc'] == raw
+    assert result['weight_g'] is None and not result['calibrated']
+    assert result['measurement_state'] == 'uncalibrated'
     assert list(adc.values) == [12345]  # No filtering or averaging.
 
 
@@ -349,3 +352,71 @@ def test_acquisition_mode_disconnection_never_becomes_zero():
     config.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
     with pytest.raises(RuntimeError):
         scale.read_weight_g(Samples([False] * 40), config)
+
+
+@pytest.mark.parametrize('factor', [1000, -1000])
+def test_verified_test_measurement_retains_raw_and_signed_grams(factor):
+    config = cfg()
+    config.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
+    config.set('load_cell', 'CALIBRATION_FACTOR', str(factor))
+    result = scale.read_measurement(Samples([10000 + 350 * factor] * 10), config)
+    assert result['raw_adc'] == 10000 + 350 * factor
+    assert result['weight_g'] == 350 and result['calibrated']
+
+
+def test_unverified_gram_only_reader_refuses_test_mode():
+    config = cfg()
+    config.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
+    config.set('load_cell', 'CALIBRATION_VERIFIED', 'false')
+    with pytest.raises(ValueError, match='verification'):
+        scale.read_weight_g(Samples([1000000]), config)
+
+
+def test_range_bypass_keeps_calibrated_noise_checks():
+    config = cfg()
+    config.set('load_cell', 'WEIGHT_TEST_MODE', 'true')
+    with pytest.raises(scale.UnstableScaleError):
+        scale.read_measurement(Samples([360000 + i * 100 for i in range(10)]), config)
+    assert scale.read_measurement(Samples([300000] * 10), config)['weight_g'] == 290
+
+
+def test_single_raw_probe_recovers_after_rejected_conversion():
+    adc = Samples([False] + [1234567] * 7)
+    assert scale.raw_samples(adc, 1) == [1234567]
+    assert not adc.values
+    assert adc._cgi_needs_settling is False
+
+
+def test_single_raw_probe_finishes_pending_settling():
+    adc = Samples([1234567] * 7)
+    adc._cgi_needs_settling = True
+    assert scale.raw_samples(adc, 1) == [1234567]
+    assert not adc.values
+
+
+def test_disconnected_raw_probe_stays_bounded_and_reports_rejections():
+    with pytest.raises(RuntimeError, match=r'attempts 10, rejected 10'):
+        scale.raw_samples(Samples([False] * 30), 1)
+
+
+@pytest.mark.parametrize('factor,offset,expected', [(1000, 875000, 125),
+                                                  (1000, 650000, 350),
+                                                  (-1000, 1125000, 125)])
+def test_million_counts_converted_once(factor, offset, expected):
+    config = cfg()
+    config.set('load_cell', 'CALIBRATION_FACTOR', str(factor))
+    config.set('load_cell', 'ZERO_OFFSET', str(offset))
+    result = scale.read_measurement(Samples([1000000] * 10), config)
+    assert result['raw_counts'] == result['raw_adc'] == 1000000
+    assert result['weight_g'] == expected
+
+
+def test_weak_calibration_reports_raw_signal_and_noise():
+    with pytest.raises(ValueError) as error:
+        scale.derive_calibration({'raw':10000, 'spread':20},
+                                 {'raw':10100, 'spread':30}, 350, cfg())
+    message = str(error.value)
+    assert 'empty=10000.0, loaded=10100.0, change=100.0 ADC counts' in message
+    assert 'empty spread=20.0, loaded spread=30.0 ADC counts' in message
+    assert '>= 600.0 ADC counts' in message
+    assert 'Calibration was not saved' in message

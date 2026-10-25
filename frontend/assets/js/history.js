@@ -1,116 +1,348 @@
-(function initHistory() {
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", initHistory);
-        return;
+document.addEventListener("DOMContentLoaded", () => {
+    const searchInput = document.getElementById("history-search");
+    const gradeFilter = document.getElementById("grade-filter");
+    const dateFilter = document.getElementById("date-filter");
+    const resetBtn = document.getElementById("reset-filters");
+    const emptyReset = document.getElementById("empty-reset");
+    const emptyState = document.getElementById("empty-state");
+    const tableWrap = document.querySelector(".table-wrap");
+    const tableFooter = document.querySelector(".table-footer");
+    const resultCount = document.getElementById("result-count");
+    const rows = [...document.querySelectorAll(".transaction-row")];
+    const detailsOverlay = document.getElementById("details-overlay");
+    const detailsCloseFooter = document.getElementById("details-close-footer");
+    const detailsPrint = document.getElementById("details-print");
+    const exportBtn = document.getElementById("export-btn");
+    let activeTransaction = null;
+    let lastTrigger = null;
+
+    function getTodayString() {
+        const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone: "Asia/Manila", year: "numeric", month: "2-digit", day: "2-digit"
+        }).formatToParts(new Date());
+        const part = type => parts.find(value => value.type === type).value;
+        return `${part("year")}-${part("month")}-${part("day")}`;
     }
-    const search = document.getElementById("history-search");
-    const sourceFilter = document.getElementById("source-filter");
-    const statusFilter = document.getElementById("status-filter");
-    const reset = document.getElementById("reset-history-filters");
-    const emptyReset = document.getElementById("history-empty-reset");
-    const empty = document.getElementById("history-empty");
-    const tableWrap = document.getElementById("history-table-wrap");
-    const resultCount = document.getElementById("history-result-count");
-    const rows = [...document.querySelectorAll(".cgi-history-row")];
-    const details = document.getElementById("history-details");
-    const detailsClose = document.getElementById("history-details-close");
-    const detailsCloseFooter = document.getElementById("history-details-close-footer");
-    let lastDetailsTrigger = null;
+
+    function daysBetween(dateString) {
+        const dayNumber = value => {
+            const [year, month, day] = value.split("-").map(Number);
+            return Date.UTC(year, month - 1, day) / 86400000;
+        };
+        return dayNumber(getTodayString()) - dayNumber(dateString);
+    }
 
     function applyFilters() {
-        if (!search || !sourceFilter || !statusFilter) return;
-        const query = search.value.trim().toLowerCase();
-        const source = sourceFilter.value;
-        const status = statusFilter.value;
+        const query = searchInput.value.trim().toLowerCase();
+        const selectedGrade = gradeFilter.value;
+        const selectedDate = dateFilter.value;
         let visible = 0;
 
-        rows.forEach(row => {
-            const matches = (!query || row.dataset.search.includes(query)) &&
-                (source === "all" || row.dataset.source === source) &&
-                (status === "all" || row.dataset.status === status);
-            row.hidden = !matches;
-            if (matches) visible++;
+        rows.forEach((row) => {
+            const idMatches = row.dataset.id.includes(query);
+            const gradeMatches = selectedGrade === "all" || row.dataset.grade === selectedGrade;
+            let dateMatches = true;
+
+            if (selectedDate === "today") {
+                dateMatches = row.dataset.date === getTodayString();
+            } else if (selectedDate !== "all") {
+                const difference = daysBetween(row.dataset.date);
+                dateMatches = difference >= 0 && difference < Number(selectedDate);
+            }
+
+            const show = idMatches && gradeMatches && dateMatches;
+            row.hidden = !show;
+            if (show) visible++;
         });
 
-        const noMatches = rows.length > 0 && visible === 0;
-        if (empty) empty.hidden = !noMatches && rows.length > 0;
-        if (tableWrap) tableWrap.hidden = rows.length === 0 || noMatches;
-        if (resultCount) {
-            resultCount.textContent = `Showing ${visible} ${visible === 1 ? "transaction" : "transactions"} on this page`;
-        }
+        const noResults = visible === 0;
+        emptyState.hidden = !noResults;
+        tableWrap.hidden = noResults;
+        tableFooter.hidden = noResults;
+        resultCount.textContent = `Showing ${visible} ${visible === 1 ? "transaction" : "transactions"}`;
     }
 
     function resetFilters() {
-        if (!search || !sourceFilter || !statusFilter) return;
-        search.value = "";
-        sourceFilter.value = "all";
-        statusFilter.value = "all";
+        searchInput.value = "";
+        gradeFilter.value = "all";
+        dateFilter.value = "all";
         applyFilters();
-        search.focus();
+        searchInput.focus();
     }
 
-    function peso(value) {
-        return `₱${Number(value || 0).toLocaleString("en-PH", {
+    searchInput.addEventListener("input", applyFilters);
+    gradeFilter.addEventListener("change", applyFilters);
+    dateFilter.addEventListener("change", applyFilters);
+    resetBtn.addEventListener("click", resetFilters);
+    emptyReset.addEventListener("click", resetFilters);
+
+    function formatDate(dateString) {
+        return new Intl.DateTimeFormat("en-PH", {
+            month: "long",
+            day: "numeric",
+            year: "numeric"
+        }).format(new Date(`${dateString}T00:00:00`));
+    }
+
+    function formatPeso(value) {
+        return `₱${Number(value).toLocaleString("en-PH", {
             minimumFractionDigits: 2,
             maximumFractionDigits: 2
         })}`;
     }
 
-    function openDetails(row, trigger) {
-        if (!details) return;
-        const transaction = JSON.parse(row.dataset.transaction);
-        lastDetailsTrigger = trigger || row;
-        document.getElementById("history-details-title").textContent = `Transaction #${transaction.id}`;
-        document.getElementById("detail-created").textContent = transaction.created_at || "-";
-        document.getElementById("detail-total").textContent = peso(transaction.total_price);
-        document.getElementById("detail-inspection").textContent = `#${transaction.inspection_id}`;
-        document.getElementById("detail-weight").textContent = `${Number(transaction.weight_kg).toFixed(3)} kg`;
-        document.getElementById("detail-price").textContent = `${peso(transaction.price_per_kg)} / kg`;
-        document.getElementById("detail-source").textContent = String(transaction.price_source || "-").toUpperCase();
-        document.getElementById("detail-status").textContent = transaction.status || "-";
-        document.getElementById("detail-print-status").textContent = transaction.print_status || "-";
-        document.getElementById("detail-notes").textContent = transaction.notes || "No notes recorded";
-        details.hidden = false;
+    function gradeClass(grade) {
+        if (grade === "Extra Class") return "grade-extra";
+        if (grade === "Class I") return "grade-one";
+        if (grade === "Class II") return "grade-two";
+        return "";
+    }
+
+    function openDetails(transaction) {
+        lastTrigger = document.activeElement;
+        activeTransaction = transaction;
+
+        document.getElementById("details-title").textContent = transaction.id;
+        document.getElementById("details-datetime").textContent = `${formatDate(transaction.date)} · ${transaction.time}`;
+
+        const grade = document.getElementById("details-grade");
+        grade.textContent = transaction.grade;
+        grade.className = `grade-badge ${gradeClass(transaction.grade)}`;
+
+        document.getElementById("details-confidence").textContent = transaction.confidence == null ? "Not recorded" : `${Number(transaction.confidence).toFixed(1)}%`;
+        document.getElementById("details-coffee").textContent = transaction.coffee;
+        document.getElementById("details-weight").textContent = `${Number(transaction.weight).toFixed(2)} g`;
+        document.getElementById("details-beans").textContent = transaction.beans.toLocaleString();
+        document.getElementById("details-defects").textContent = transaction.defects == null ? "Not recorded" : transaction.defects.toLocaleString();
+        document.getElementById("details-points").textContent = transaction.defectPercentage == null ? "Not recorded" : `${Number(transaction.defectPercentage).toFixed(3)}% defects`;
+        document.getElementById("details-reference").textContent = `${formatPeso(transaction.referencePrice)}/kg`;
+        document.getElementById("details-recorded-weight").textContent = `${Number(transaction.weight).toFixed(2)} g`;
+        document.getElementById("details-price").textContent = formatPeso(transaction.suggestedPrice);
+
+        const defectList = document.getElementById("details-defect-list");
+        defectList.innerHTML = "";
+
+        if (!transaction.defectList.length) {
+            defectList.innerHTML = `<div class="defect-item"><span>Defect breakdown not recorded</span><strong>—</strong></div>`;
+        } else {
+            transaction.defectList.forEach((defect) => {
+                const item = document.createElement("div");
+                item.className = "defect-item";
+                item.innerHTML = `<span>${escapeHTML(defect.name)}</span><strong>${Number(defect.count)} · ${Number(defect.percentage).toFixed(3)}%</strong>`;
+                defectList.appendChild(item);
+            });
+        }
+
+        detailsOverlay.hidden = false;
         document.body.classList.add("details-open");
-        requestAnimationFrame(() => details.classList.add("is-open"));
-        detailsClose?.focus();
+        detailsCloseFooter?.focus();
     }
 
     function closeDetails() {
-        if (!details || details.hidden) return;
-        details.classList.remove("is-open");
-        window.setTimeout(() => { details.hidden = true; }, 220);
+        detailsOverlay.hidden = true;
         document.body.classList.remove("details-open");
-        lastDetailsTrigger?.focus();
+        activeTransaction = null;
+        lastTrigger?.focus();
     }
 
-    search?.addEventListener("input", applyFilters);
-    sourceFilter?.addEventListener("change", applyFilters);
-    statusFilter?.addEventListener("change", applyFilters);
-    reset?.addEventListener("click", resetFilters);
-    emptyReset?.addEventListener("click", resetFilters);
+    function escapeHTML(value) {
+        return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+    }
 
-    rows.forEach(row => {
-        row.addEventListener("click", event => {
-            if (event.target.closest("a, button, form")) return;
-            openDetails(row, row);
+    rows.forEach((row) => {
+        const transaction = JSON.parse(row.dataset.transaction);
+
+        row.addEventListener("click", (event) => {
+            if (event.target.closest(".print-btn") || event.target.closest(".view-btn")) return;
+            openDetails(transaction);
         });
-        row.addEventListener("keydown", event => {
-            if (event.key === "Enter") openDetails(row, row);
+
+        row.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" && event.target === row) openDetails(transaction);
         });
-        row.querySelector(".cgi-history-view")?.addEventListener("click", event => {
-            openDetails(row, event.currentTarget);
+
+        row.querySelector(".view-btn").addEventListener("click", () => {
+            openDetails(transaction);
+        });
+
+        row.querySelector(".print-btn").addEventListener("click", () => {
+            printReceipt(transaction);
         });
     });
 
-    detailsClose?.addEventListener("click", closeDetails);
     detailsCloseFooter?.addEventListener("click", closeDetails);
-    details?.addEventListener("click", event => {
-        if (event.target === details) closeDetails();
+
+    detailsOverlay.addEventListener("click", (event) => {
+        if (event.target === detailsOverlay) closeDetails();
     });
-    document.addEventListener("keydown", event => {
-        if (event.key === "Escape" && details && !details.hidden) closeDetails();
+
+    document.addEventListener("keydown", (event) => {
+        if (detailsOverlay.hidden) return;
+        if (event.key === "Escape") closeDetails();
+        if (event.key === "Tab") {
+            const buttons = [...detailsOverlay.querySelectorAll("button")];
+            const first = buttons[0];
+            const last = buttons[buttons.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        }
     });
+
+    detailsPrint.addEventListener("click", () => {
+        if (activeTransaction) printReceipt(activeTransaction);
+    });
+
+    function buildReceipt(transaction) {
+        return `
+        <div class="receipt-paper">
+            <div class="receipt-brand">
+                <h3>COFFEE GRADE<br>IDENTIFICATION</h3>
+                <p>Quality Assessment Receipt</p>
+            </div>
+
+            <div class="receipt-rule"></div>
+
+            <div class="receipt-row">
+                <span>Transaction ID</span>
+                <strong>${escapeHTML(transaction.id)}</strong>
+            </div>
+            <div class="receipt-row">
+                <span>Date</span>
+                <strong>${escapeHTML(formatDate(transaction.date))}</strong>
+            </div>
+            <div class="receipt-row">
+                <span>Time</span>
+                <strong>${escapeHTML(transaction.time)}</strong>
+            </div>
+
+            <div class="receipt-rule"></div>
+
+            <div class="receipt-row">
+                <span>Coffee type</span>
+                <strong>${escapeHTML(transaction.coffee)}</strong>
+            </div>
+            <div class="receipt-row">
+                <span>Quality grade</span>
+                <strong>${escapeHTML(transaction.grade)}</strong>
+            </div>
+            <div class="receipt-row">
+                <span>Weight</span>
+                <strong>${Number(transaction.weight).toFixed(2)} g</strong>
+            </div>
+            <div class="receipt-row"><span>Detected beans</span><strong>${Number(transaction.beans).toLocaleString()}</strong></div>
+            <div class="receipt-row"><span>Detected defects</span><strong>${transaction.defects == null ? 'Not recorded' : Number(transaction.defects)}</strong></div>
+            <div class="receipt-row"><span>Defects (%)</span><strong>${transaction.defectPercentage == null ? 'Not recorded' : Number(transaction.defectPercentage).toFixed(3) + '%'}</strong></div>
+            <div class="receipt-row">
+                <span>Reference price</span>
+                <strong>${formatPeso(transaction.referencePrice)} / kg</strong>
+            </div>
+
+            <div class="receipt-rule"></div>
+
+            <div class="receipt-total">
+                <span>SUGGESTED PRICE</span>
+                <strong>${formatPeso(transaction.suggestedPrice)}</strong>
+            </div>
+
+            <div class="receipt-rule"></div>
+
+            <p class="receipt-note">
+                This receipt contains a suggested transaction price and does not represent a finalized sale.
+            </p>
+
+            <p class="receipt-thank-you">
+                Thank you for using CGI.
+            </p>
+        </div>
+    `;
+    }
+
+    function printReceipt(transaction) {
+        const printArea = document.getElementById("receipt-print-area");
+
+        if (!printArea) return;
+
+        printArea.innerHTML = buildReceipt(transaction);
+        document.body.classList.add("printing-history-receipt");
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                window.print();
+            });
+        });
+    }
+
+    window.addEventListener("afterprint", () => {
+        document.body.classList.remove("printing-history-receipt");
+    });
+
+    exportBtn.addEventListener("click", () => {
+        const visibleTransactions = rows
+            .filter((row) => !row.hidden)
+            .map((row) => JSON.parse(row.dataset.transaction));
+
+        if (!visibleTransactions.length) return;
+
+        const headers = [
+            "Transaction ID",
+            "Date",
+            "Time",
+            "Coffee Type",
+            "Weight (g)",
+            "Detected Beans",
+            "Detected Defects",
+            "Defects (%)",
+            "Grade",
+            "Confidence (%)",
+            "Reference Price (PHP/kg)",
+            "Suggested Price (PHP)"
+        ];
+
+        const csvRows = visibleTransactions.map((transaction) => [
+            transaction.id,
+            transaction.date,
+            transaction.time,
+            transaction.coffee,
+            transaction.weight,
+            transaction.beans,
+            transaction.defects,
+            transaction.defectPercentage,
+            transaction.grade,
+            transaction.confidence,
+            transaction.referencePrice,
+            transaction.suggestedPrice
+        ]);
+
+        const csv = [headers, ...csvRows]
+            .map((row) => row.map(csvValue).join(","))
+            .join("\n");
+
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `CGI-Transaction-History-${getTodayString()}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+    });
+
+    function csvValue(value) {
+        const raw = String(value ?? "");
+        const string = /^[=+@\-\t\r]/.test(raw) ? "\'" + raw : raw;
+        return `"${string.replaceAll('"', '""')}"`;
+    }
 
     applyFilters();
-})();
+});

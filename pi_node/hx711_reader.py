@@ -79,8 +79,13 @@ def raw_samples(hx, readings=10, timeout=4.0):
     deadline = time.monotonic() + timeout
     values = []
     attempts = 0
+    invalid = 0
+    # Allow the six settling conversions as well as the requested samples.
+    # A one-sample live probe previously had only four attempts, so it could
+    # never recover after a rejected conversion or pending settling.
+    max_attempts = readings * 4 + 6
     settling = 6 if getattr(hx, '_cgi_needs_settling', False) is True else 0
-    while len(values) < readings and time.monotonic() < deadline and attempts < readings * 4:
+    while len(values) < readings and time.monotonic() < deadline and attempts < max_attempts:
         # Keep cadence across batches and worker requests, including calibration.
         # Schedule from read start: a blocking 80 Hz ADC already supplies the delay.
         next_read = getattr(hx, '_cgi_next_read_at', 0.0)
@@ -102,6 +107,7 @@ def raw_samples(hx, readings=10, timeout=4.0):
             # The driver's False can indicate a bit-pulse timing violation and
             # unintended power-down. Abandon partial data and discard six fresh
             # conversions before trusting another complete batch.
+            invalid += 1
             values.clear()
             settling = 6
             hx._cgi_needs_settling = True
@@ -113,20 +119,31 @@ def raw_samples(hx, readings=10, timeout=4.0):
             continue
         values.append(value)
     if len(values) != readings:
-        raise RuntimeError('HX711 did not return enough valid samples; check wiring, power and GPIO timing')
+        raise RuntimeError(
+            'HX711 did not return enough valid samples; check wiring, power and GPIO timing '
+            f'(received {len(values)}/{readings}, attempts {attempts}, '
+            f'rejected {invalid}, settling remaining {settling})')
     return values
 
 
 def filtered_sample(hx, readings=10):
+    if readings < 5:
+        raise ValueError('READINGS_TO_AVERAGE must be at least 5 for median filtering')
     values = raw_samples(hx, readings)
     median = statistics.median(values)
     mad = statistics.median(abs(v - median) for v in values)
     # Reject isolated glitches; never average older batches into a new load.
-    limit = max(3.0, 6 * mad)
+    limit = max(1.0, 6 * mad)  # One ADC count is the quantization floor.
     kept = [v for v in values if abs(v - median) <= limit]
     if len(kept) < math.ceil(readings * .8):
         raise UnstableScaleError('Scale moving or noisy; wait for it to settle')
-    return {'raw': statistics.mean(kept), 'spread': max(kept) - min(kept),
+    # Rolling median of five valid conversions, then a short batch average.
+    # Start each acquisition fresh so prior loads never leak into a new one.
+    medians = [statistics.median(values[i:i + 5]) for i in range(len(values) - 4)]
+    filtered = [v for v in medians if abs(v - median) <= limit]
+    if not filtered:
+        raise UnstableScaleError('Scale unstable')
+    return {'raw': statistics.mean(filtered), 'spread': max(kept) - min(kept),
             'rejected': readings - len(kept), 'samples': readings,
             'minimum': min(kept), 'maximum': max(kept)}
 
@@ -161,34 +178,57 @@ def calibration_values(cfg):
 
 def tolerance_g(cfg):
     tolerance = cfg.getfloat('load_cell', 'MAX_SPREAD_G', fallback=.5)
-    if not math.isfinite(tolerance) or not 0 < tolerance <= 1:
-        raise ValueError('MAX_SPREAD_G must be greater than 0 and at most 1 g')
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError('MAX_SPREAD_G must be finite and greater than 0 g')
     return tolerance
 
 
 def weight_test_mode(cfg):
-    """Explicit acquisition test; keep normal calibration checks available."""
+    """Bypass the transaction weight range only; retain measurement checks."""
     return cfg.getboolean('load_cell', 'WEIGHT_TEST_MODE', fallback=False)
 
 
+def sensor_test_mode(cfg):
+    return cfg.getboolean('load_cell', 'WEIGHT_SENSOR_TEST_MODE', fallback=False)
+
+
 def sample_weight(hx, cfg):
-    if weight_test_mode(cfg):
-        # One fresh conversion: no averaging, outlier removal, clamp or auto-tare.
-        # Retain the configured conversion, even when it is not yet verified.
-        factor = cfg.getfloat('load_cell', 'CALIBRATION_FACTOR')
-        offset = cfg.getfloat('load_cell', 'ZERO_OFFSET')
-        if not math.isfinite(factor) or factor == 0 or not math.isfinite(offset):
-            raise ValueError('A finite nonzero conversion factor and finite zero are required')
-        return (raw_samples(hx, 1)[0] - offset) / factor
-    factor, offset = calibration_values(cfg)
+    calibration_values(cfg)  # Gram-only callers must fail before acquiring uncalibrated data.
+    return read_measurement(hx, cfg)['weight_g']
+
+
+def read_measurement(hx, cfg):
+    """Keep ADC counts independent of the optional verified grams conversion."""
+    if sensor_test_mode(cfg):
+        # Acquisition diagnostics: retain the actual conversion, without stability filtering.
+        raw = raw_samples(hx, 1)[0]
+        result = {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts',
+                  'weight_g': None, 'calibrated': False, 'measurement_state': 'uncalibrated'}
+        try:
+            factor, offset = calibration_values(cfg)
+        except (ValueError, configparser.Error):
+            return result
+        weight = (raw - offset) / factor
+        if math.isfinite(weight):
+            result.update(weight_g=weight, calibrated=True, measurement_state='sensor_testing')
+        return result
+    try:
+        factor, offset = calibration_values(cfg)
+    except (ValueError, configparser.Error):
+        # Keep live diagnostics available without inventing a grams conversion.
+        raw = raw_samples(hx, 1)[0]
+        return {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts', 'weight_g': None,
+                'calibrated': False, 'measurement_state': 'uncalibrated'}
     sample = filtered_sample(hx, cfg.getint('load_cell', 'READINGS_TO_AVERAGE'))
+    raw = sample['raw']
+    result = {'raw_counts': raw, 'raw_adc': raw, 'raw_unit': 'ADC counts'}
     if sample['spread'] / abs(factor) > tolerance_g(cfg):
         raise UnstableScaleError('Scale moving or noisy; wait for it to settle')
-    # Keep polarity and negative net loads. No zero clamp or auto-tare.
-    weight = (sample['raw'] - offset) / factor
+    weight = (raw - offset) / factor
     if not math.isfinite(weight):
         raise ValueError('Calibration produced a nonfinite weight; recalibrate')
-    return weight
+    result.update(weight_g=weight, calibrated=True, measurement_state='calibrated')
+    return result
 
 
 def read_weight_g(hx, cfg):
@@ -224,7 +264,15 @@ def derive_calibration(empty, loaded, known_g, cfg):
     delta = loaded['raw'] - empty['raw']
     noise = max(empty['spread'], loaded['spread'], 1.0)
     if not math.isfinite(delta) or abs(delta) < 20 * noise:
-        raise ValueError('Calibration signal too small relative to noise; use a larger known mass and check mounting/wiring')
+        raise ValueError(
+            'Calibration signal too small relative to noise; '
+            f'empty={empty["raw"]:.1f}, loaded={loaded["raw"]:.1f}, '
+            f'change={delta:.1f} ADC counts; '
+            f'empty spread={empty["spread"]:.1f}, loaded spread={loaded["spread"]:.1f} ADC counts. '
+            f'Required absolute change >= {20 * noise:.1f} ADC counts (20 x spread). '
+            'Keep the empty tray still for zero, then add the accurately known mass and let it settle. '
+            'If this repeats, check mounting/wiring and acquisition stability. Calibration was not saved.'
+        )
     factor = delta / known_g  # Negative is legitimate when cell polarity is reversed.
     if not math.isfinite(factor) or factor == 0:
         raise ValueError('Invalid calibration sensitivity')
@@ -294,19 +342,19 @@ def main():
     worker = ScaleWorker()
     try:
         if args.calibrate:
-            input('Remove ALL removable loads, including the tray; leave the fixed platform. Press ENTER: ')
-            empty = terminal_reference(worker, 'Bare platform')
+            input('Remove all samples; leave the empty tray installed. Press ENTER: ')
+            empty = terminal_reference(worker, 'Empty tray')
             known = float(input('Accurately known calibration mass in grams (prefer near 350 g): '))
             if not math.isfinite(known) or known <= 0:
                 raise ValueError('Known mass must be positive and finite')
-            input('Place ONLY that known mass on the platform, wait for settling, then press ENTER: ')
+            input('Place ONLY that known mass in the empty tray, wait for settling, then press ENTER: ')
             loaded = terminal_reference(worker, 'Known load',
                 lambda sample: derive_calibration(empty, sample, known, cfg))
             factor = derive_calibration(empty, loaded, known, cfg)
             print(f"Signed sensitivity: {factor:.6f} counts/g; noise spread: {loaded['spread']/abs(factor):.3f} g")
             terminal_reference(worker, 'Loaded verification',
                 lambda sample: verify_reference(sample, loaded, factor, cfg, 'Loaded verification'))
-            input('Remove the calibration mass; leave the bare platform. Wait, then press ENTER: ')
+            input('Remove the calibration mass; leave the empty tray installed. Wait, then press ENTER: ')
             unloaded = terminal_reference(worker, 'Zero return',
                 lambda sample: verify_reference(sample, empty, factor, cfg, 'Zero return'))
             cfg = _load_config()
@@ -317,9 +365,9 @@ def main():
             cfg.set('load_cell', 'CALIBRATED_AT', datetime.now(timezone.utc).isoformat())
             cfg.set('load_cell', 'CALIBRATION_VERIFIED', 'true')
             save_scale_config(cfg)
-            print('Verified calibration and bare-platform zero saved to config.ini')
+            print('Verified calibration and empty-tray zero saved to config.ini')
         elif args.tare:
-            input('Remove beans; leave the empty tray (or bare platform for zeroing). Wait, then press ENTER: ')
+            input('Remove beans; leave the empty tray installed. Wait, then press ENTER: ')
             # Retry complete verified tare attempts; a rejected attempt saves nothing.
             deadline = time.monotonic() + 60
             for attempt in range(3):

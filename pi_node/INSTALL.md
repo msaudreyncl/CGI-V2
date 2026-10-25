@@ -100,9 +100,9 @@ sudo systemctl stop cgi-node
 CGI_HARDWARE_MODE=hardware venv/bin/python hx711_reader.py --calibrate
 ```
 
-The updated wizard requires a **bare-platform reference**, a known mass, loaded
-verification and a return-to-zero check. Remove the removable tray for calibration;
-then weigh the empty tray and tare it separately. Recalibrate once after deploying
+The updated wizard requires a **empty-tray reference**, a known mass, loaded
+verification and a return-to-zero check. Leave the empty tray installed for calibration;
+remove all samples before measuring zero or taring. Recalibrate once after deploying
 the verified-calibration update; older factors are not silently trusted.
 
 See [WEIGHT_CALIBRATION.md](WEIGHT_CALIBRATION.md) for the complete commands,

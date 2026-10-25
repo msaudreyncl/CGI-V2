@@ -3,6 +3,7 @@
 GET /weight includes independent camera/scale readiness. POST /weight tares the
 empty platform. POST /capture accepts view A or B. Run one server per Pi.
 """
+from collections import deque
 import base64
 import json
 import math
@@ -14,8 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from hardware_runtime import CameraWorker, ScaleWorker, simulated
-from hx711_reader import (_load_config, UnstableScaleError, calibration_values,
-                          derive_calibration, verify_reference, save_scale_config, weight_test_mode)
+from hx711_reader import (_load_config, UnstableScaleError,
+                          derive_calibration, verify_reference, save_scale_config, weight_test_mode, tolerance_g, sensor_test_mode)
 
 _scale_lock = threading.Lock()
 _scale_worker = ScaleWorker()
@@ -23,6 +24,8 @@ _camera_lock = threading.Lock()
 _calibration = None
 _last_weight = None
 _last_read_at = 0
+_weight_window = deque()
+_unstable_since = None
 _camera_checked_at = 0
 _camera_status = 'error'
 _camera_error = None
@@ -30,28 +33,49 @@ _camera_worker = CameraWorker()
 
 
 def _read_weight():
-    global _last_weight, _last_read_at
+    global _last_weight, _last_read_at, _unstable_since
     with _scale_lock:
         try:
             cfg = _load_config()
             if _calibration and time.monotonic() < _calibration['expires']:
                 raise UnstableScaleError('Calibration in progress')
-            if not simulated(cfg) and not weight_test_mode(cfg):
-                try:
-                    calibration_values(cfg)
-                except ValueError:
-                    # A responding ADC can be calibrated in Step 2 even before
-                    # it has a valid grams conversion. Never fabricate a weight.
-                    _scale_worker.request('probe')
-                    raise UnstableScaleError('Calibration required — calibrate the scale in Step 2')
-            weight = 350.0 if simulated(cfg) else _scale_worker.request('weight')
+            if sensor_test_mode(cfg) and simulated(cfg):
+                raise RuntimeError('Sensor testing requires physical HX711 hardware mode')
+            measurement = ({'weight_g': 350.0, 'raw_adc': None, 'calibrated': False,
+                            'measurement_state': 'simulated'} if simulated(cfg)
+                           else _scale_worker.request('measurement'))
+            if sensor_test_mode(cfg):
+                return measurement, False, False
+            weight = measurement['weight_g']
+            if weight is None:
+                _last_weight = None
+                return measurement, False, False
             if not math.isfinite(weight):
                 raise ValueError('Scale returned a nonfinite reading')
             now = time.monotonic()
-            stable = (_last_weight is not None and now - _last_read_at < 10
-                      and abs(weight - _last_weight) <= 0.5)
+            duration = cfg.getfloat('load_cell', 'STABILITY_DURATION_S', fallback=1.0)
+            unstable_after = cfg.getfloat('load_cell', 'UNSTABLE_AFTER_S', fallback=8.0)
+            floor = cfg.getfloat('load_cell', 'SAMPLE_NOISE_FLOOR_G', fallback=1.0)
+            if not all(math.isfinite(v) and v > 0 for v in (duration, unstable_after, floor)):
+                raise ValueError('Invalid scale stability/noise configuration')
+            if _last_weight is None or now - _last_read_at >= 10:
+                _weight_window.clear()
+                _unstable_since = now
+            _weight_window.append((now, weight))
+            # Retain the sample immediately preceding the duration boundary.
+            while len(_weight_window) > 1 and _weight_window[1][0] <= now - duration:
+                _weight_window.popleft()
+            stable = (now - _weight_window[0][0] >= duration
+                      and max(w for _, w in _weight_window) - min(w for _, w in _weight_window) <= tolerance_g(cfg))
+            if stable:
+                _unstable_since = None
+            elif _unstable_since is None:
+                _unstable_since = now
+            measurement.update(sample_noise_floor_g=floor,
+                measurement_state=('calibrated' if stable else 'unstable'
+                    if now - _unstable_since >= unstable_after else 'stabilizing'))
             _last_weight, _last_read_at = weight, now
-            return weight, stable, 340 <= weight <= 360
+            return measurement, stable, 340 <= weight <= 360
         except Exception:
             _last_weight = None
             raise
@@ -198,11 +222,12 @@ class PiRequestHandler(BaseHTTPRequestHandler):
                        'weight_test_mode': weight_test_mode(cfg) and not simulated(cfg)}
             code = 200
             try:
-                weight, stable, in_range = _read_weight()
-                payload.update(weight_g=weight, measured_at=datetime.now(timezone.utc).isoformat(), stable=stable,
+                measurement, stable, in_range = _read_weight()
+                payload.update(measurement)
+                payload.update(measured_at=datetime.now(timezone.utc).isoformat(), stable=stable,
                                in_range=in_range, scale='ready')
                 if not payload['simulated']:
-                    print(json.dumps({'event': 'hx711_reading', 'weight_g': weight,
+                    print(json.dumps({'event': 'hx711_reading', **measurement,
                                       'measured_at': payload['measured_at']}, allow_nan=False), flush=True)
             except UnstableScaleError as exc:
                 payload.update(error=str(exc), measurement_state='unstable', scale='ready',
